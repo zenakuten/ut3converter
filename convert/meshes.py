@@ -1,0 +1,498 @@
+"""Static mesh conversion: UE3 StaticMesh/StaticMeshActor -> UT2004.
+
+Meshes become ASE files imported by `#exec STATICMESH IMPORT` into the same
+package as the textures (the ASE importer resolves `*BITMAP` names against
+already-loaded textures, so they must share a package and the textures must be
+imported first). Actors become t3d StaticMeshActors.
+"""
+
+import os
+import re
+import struct
+
+from ut2.ase import write_ase
+from ut2.t3d import Actor, rot, vec
+from convert.rotation import axis_images, multiply, rotate, rotation_matrix, to_rotator
+from convert.shaders import (effect_substitute, mesh_is_effect, sheet_is_horizontal,
+                             water_substitute)
+from ut3.objects.level import ordered_exports
+from ut3.objects.material import material_uv_channel
+from ut3.objects.staticmesh import read_static_mesh, validate
+from ut3.props import read_object_properties
+
+_SANITIZE = re.compile(r"[^A-Za-z0-9_]")
+
+ACTOR_CLASSES = ("StaticMeshActor", "InterpActor", "UTDeployableNodeLocker",
+                 # Warfare scenery whose mechanic does not convert but whose
+                 # geometry should still be there -- see convert/onslaught.py.
+                 "UTOnslaughtTarydiumMine_Content",
+                 "UTOnslaughtTarydiumProcessor_Content")
+
+
+def sanitize(name):
+    out = _SANITIZE.sub("_", name or "")
+    if out and out[0].isdigit():
+        out = "_" + out
+    return out or "Mesh"
+
+
+class MeshStats:
+    def __init__(self):
+        self.meshes = 0
+        self.actors = 0
+        self.triangles = 0          # unique mesh triangles
+        self.scene_triangles = 0    # triangles once placed
+        self.skipped_unreadable = 0
+        self.skipped_no_mesh = 0
+        self.failed = []
+        self.actor_mesh_names = []
+        self.mesh_triangle_counts = {}
+        self.skipped_effects = 0
+        self.jump_pad_meshes = 0
+        self.substituted_effects = 0
+        self.substituted_water = 0
+        self.component_transforms = 0
+        self.non_colliding = 0
+        self.non_blocking = 0
+        self.skipped_hidden = 0
+        self.uv_channels = {}       # mesh -> the UV set its material asks for
+
+    def __str__(self):
+        out = ("%d static meshes (%d triangles), %d actors placing %d triangles"
+               % (self.meshes, self.triangles, self.actors, self.scene_triangles))
+        if self.skipped_no_mesh:
+            out += "; %d actors without a mesh" % self.skipped_no_mesh
+        if self.skipped_hidden:
+            out += "; %d never drawn in UT3 either" % self.skipped_hidden
+        if self.skipped_effects:
+            out += "; %d effect actors skipped" % self.skipped_effects
+        if self.jump_pad_meshes:
+            out += ("; %d jump pads given the marker UT2004's own draws nothing for"
+                    % self.jump_pad_meshes)
+        if self.substituted_effects:
+            out += "; %d given a stock UT2004 effect material" % self.substituted_effects
+        if self.substituted_water:
+            out += "; %d water surface(s) given a stock UT2004 material" % self.substituted_water
+        if self.component_transforms:
+            out += ("; %d actor(s) carrying a component transform of their own"
+                    % self.component_transforms)
+        if self.non_colliding or self.non_blocking:
+            out += "; %d walk-through, %d non-blocking (as UT3 has them)" % (
+                self.non_colliding, self.non_blocking)
+        if self.skipped_unreadable:
+            out += "; %d meshes unreadable" % self.skipped_unreadable
+        if self.uv_channels:
+            out += "; %d using a second UV set (%s)" % (
+                len(self.uv_channels),
+                ", ".join(sorted(self.uv_channels)[:3])
+                + (", ..." if len(self.uv_channels) > 3 else ""))
+        return out
+
+
+class MeshSet:
+    """Unique meshes referenced by the level, keyed by reference and materials.
+
+    A UT3 StaticMeshComponent may override the mesh's own materials per actor,
+    and 382 of DM-HeatRay's mesh actors do. UT2004 keeps materials on the mesh
+    itself with no per-actor override, so a mesh used with two different
+    material sets has to be exported twice. Only 23 of 179 meshes here need
+    that; the rest are consistent and cost nothing.
+    """
+
+    def __init__(self, package_name):
+        self.package_name = package_name
+        self.by_ref = {}     # (is_import, index, materials) -> mesh name
+        self.meshes = {}     # mesh name -> (Package, export, material overrides)
+
+    def name_for(self, ref, overrides=()):
+        if ref is None or ref.is_null:
+            return None
+        name = self.by_ref.get((ref.is_import, ref.index, overrides))
+        if not name:
+            return None
+        return "%s.%s" % (self.package_name, name)
+
+    def _unique(self, base):
+        name = sanitize(base)
+        if name not in self.meshes:
+            return name
+        n = 2
+        while "%s_%d" % (name, n) in self.meshes:
+            n += 1
+        return "%s_%d" % (name, n)
+
+    def add(self, pkg, index, ref, overrides=()):
+        # Key on the material *paths*: object references are distinct instances
+        # per actor, so keying on them would split every actor into its own mesh.
+        key = (ref.is_import, ref.index,
+               tuple(None if r is None else str(r) for r in overrides))
+        if key in self.by_ref:
+            return self.by_ref[key]
+        owner, export = index.resolve(pkg, ref)
+        if export is None or owner.class_name_of(export) != "StaticMesh":
+            self.by_ref[key] = None
+            return None
+        signature = key[2]
+        for name, (existing_pkg, existing, existing_over) in self.meshes.items():
+            if (existing_pkg is owner and existing.index == export.index
+                    and tuple(None if r is None else str(r)
+                              for r in existing_over) == signature):
+                self.by_ref[key] = name
+                return name
+        name = self._unique(export.name)
+        self.meshes[name] = (owner, export, overrides)
+        self.by_ref[key] = name
+        return name
+
+
+def _hidden_in_game(comp):
+    """Does UE3 draw this component at all?
+
+    `HiddenGame` on a PrimitiveComponent means it is never rendered in play --
+    UE3's way of keeping geometry that exists only to cast a shadow or block an
+    occlusion query. CTF-FacingWorlds has 21 of them, a group the author named
+    "necris cloud shadowcasters", and because nothing draws them their material
+    is arbitrary: one wears a stone floor texture. Converted, they appear as
+    solid brown slabs hanging in the sky.
+    """
+    return comp is not None and comp.get("HiddenGame") is True
+
+
+def _collision_off(props, comp):
+    """Does UT3 mark this actor as something you walk through?
+
+    UE3 states it in two places and either is enough: `bCollideActors` on the
+    actor, or `CollideActors` on the component that carries the mesh. UT2004's
+    StaticMeshActor defaults to solid on both counts (bCollideActors,
+    bBlockActors and bBlockKarma all True), so ignoring this makes every piece
+    of decoration a wall -- 930 actors on DM-Deck, 269 on DM-HeatRay, including
+    the sheet drawn over a goo pit you are supposed to fall into.
+    """
+    if props.get("bCollideActors") is False:
+        return True
+    return comp is not None and comp.get("CollideActors") is False
+
+
+def _material_overrides(pkg, comp):
+    """The component's Materials array, as a hashable tuple of refs."""
+    materials = comp.get("Materials")
+    if materials is None or not len(materials):
+        return ()
+    try:
+        refs = materials.as_objects()
+    except (ValueError, struct.error):
+        return ()
+    return tuple(None if r is None or r.is_null else r for r in refs)
+
+
+def _mesh_ref(comp, owner=None, index=None):
+    """The component's StaticMesh, following the archetype chain if inherited.
+
+    A gameplay actor keeps its mesh on the class rather than the instance, so
+    the cooked component says nothing: WAR-PowerSurge's Tarydium mine and
+    processor both come out meshless if only the instance is read.
+    """
+    ref = comp.get("StaticMesh")
+    if ref is not None and not ref.is_null:
+        return ref
+    if owner is None or index is None or getattr(comp, "export", None) is None:
+        return None
+    from ut3.objects.sound import _archetype_props
+
+    ref = _archetype_props(owner, index, comp.export).get("StaticMesh")
+    if ref is not None and hasattr(ref, "is_null") and not ref.is_null:
+        return ref
+    return None
+
+
+def _component_of(pkg, export, props):
+    """The actor's StaticMeshComponent properties."""
+    # CollisionComponent comes last: on an actor that has both, it is often the
+    # skeletal mesh, and WAR-PowerSurge's Tarydium processor keeps its static
+    # mesh under a property simply called "StaticMesh".
+    ref = (props.get("StaticMeshComponent") or props.get("StaticMesh")
+           or props.get("CollisionComponent"))
+    if ref is not None and ref.is_export:
+        comp_props, start, _end = read_object_properties(pkg, ref.export)
+        if start is not None:
+            # Carried so the mesh lookup can follow the archetype chain.
+            comp_props.export = ref.export
+            return comp_props
+    for name, idx in export.components.items():
+        if "StaticMesh" in name:
+            comp = pkg.ref(idx)
+            if comp.is_export:
+                comp_props, start, _end = read_object_properties(pkg, comp.export)
+                if start is not None:
+                    comp_props.export = comp.export
+                    return comp_props
+    return None
+
+
+def _vector_of(props, name, default=(1.0, 1.0, 1.0)):
+    value = props.get(name)
+    if value is None or not value.value:
+        return default
+    return tuple(value.value)
+
+
+def _effective_transform(props, comp):
+    """(rotation, DrawScale3D, world offset) with the component's own folded in.
+
+    A UE3 StaticMeshComponent carries a transform of its own, relative to the
+    actor holding it, and UT3 maps use it: DM-Diesel hangs 40 meshes on a
+    component pitched a quarter turn, which is why its pipes converted lying
+    down instead of standing up. UT2004 has one transform per actor and no
+    component to put a second on, so the two are composed into it.
+
+    The composition has to be read in the order UE3 applies it,
+
+        v * Scale_c * Rot_c * Trans_c * Scale_a * Rot_a * Trans_a
+
+    against the one UT2004 offers,
+
+        v * Scale * Rot * Trans
+
+    so the rotations simply multiply, but the actor's scale ends up on the wrong
+    side of the component's rotation. Non-uniform scale and rotation do not
+    commute in general -- which would matter, since 112 of the 202 such actors
+    in the stock maps do carry a non-uniform DrawScale3D. They commute exactly
+    when the rotation sends axes to axes: `Rot_c * Scale_a` is then
+    `Scale_permuted * Rot_c`, the scale factors merely swapped between axes.
+    Every component rotation in the stock maps is a whole quarter turn (yaw 180
+    on 98 of them, pitch 90 on 94, roll 90 on the rest), so the swap is exact
+    and nothing is approximated.
+    """
+    rotation = tuple(int(c) for c in _vector_of(props, "Rotation", (0, 0, 0)))
+    scale3d = _vector_of(props, "DrawScale3D")
+    offset = (0.0, 0.0, 0.0)
+    if comp is None:
+        return rotation, scale3d, offset
+
+    comp_rot = tuple(int(c) for c in _vector_of(comp, "Rotation", (0, 0, 0)))
+    comp_scale = comp.get("Scale", 1.0)
+    comp_scale3d = _vector_of(comp, "Scale3D")
+    comp_offset = _vector_of(comp, "Translation", (0.0, 0.0, 0.0))
+
+    if any(comp_rot):
+        turn = rotation_matrix(comp_rot)
+        rotation = to_rotator(multiply(turn, rotation_matrix(rotation)))
+        images = axis_images(turn)
+        if images is not None:
+            scale3d = tuple(scale3d[images[i]] for i in range(3))
+    scale3d = tuple(scale3d[i] * comp_scale3d[i] * comp_scale for i in range(3))
+    if any(comp_offset):
+        # Stated before the actor's own scale and rotation, so it picks both up
+        # on the way out. No stock map has one; this is here so a map that does
+        # is not silently misplaced.
+        actor_scale = _vector_of(props, "DrawScale3D")
+        drawscale = props.get("DrawScale", 1.0)
+        scaled = tuple(comp_offset[i] * actor_scale[i] * drawscale for i in range(3))
+        offset = rotate(scaled, rotation_matrix(
+            tuple(int(c) for c in _vector_of(props, "Rotation", (0, 0, 0)))))
+    return rotation, scale3d, offset
+
+
+def convert_actors(pkg, index, mesh_set, texture_set=None, scale=1.0, stats=None,
+                   skip_effects=True, skip=(), no_collision=()):
+    """Collect static mesh actors and emit t3d StaticMeshActors.
+
+    `skip` names actors handled elsewhere -- an InterpActor that became a Mover
+    would otherwise be placed twice, once moving and once parked. `no_collision`
+    names ones that must stay visible but stop blocking, which is how a power
+    node's pad scenery makes room for the node's own touch cylinder.
+    """
+    stats = stats or MeshStats()
+    out = []
+    names = set()
+    effect_cache = {}
+    skip = set(skip)
+    for export in ordered_exports(pkg, ACTOR_CLASSES):
+        if export.name in skip:
+            continue
+        source_class = pkg.class_name_of(export)
+        props, start, _end = read_object_properties(pkg, export)
+        if start is None:
+            continue
+        comp = _component_of(pkg, export, props)
+        if comp is None:
+            stats.skipped_no_mesh += 1
+            continue
+        mesh_ref = _mesh_ref(comp, pkg, index)
+        if mesh_ref is None or mesh_ref.is_null:
+            stats.skipped_no_mesh += 1
+            continue
+        if _hidden_in_game(comp):
+            stats.skipped_hidden += 1
+            continue
+        # Unlit translucent effects (light beams, fog sheets) have no textured
+        # equivalent in UE2 and cost fill rate for nothing -- see shaders.py.
+        # Unless UT2004 already ships a material that says the same thing, in
+        # which case the actor is kept and wears that instead.
+        substitute = None
+        if skip_effects and mesh_is_effect(pkg, index, mesh_ref, effect_cache):
+            rotation = props.get("Rotation")
+            substitute = effect_substitute(pkg, index, mesh_ref,
+                                           _material_overrides(pkg, comp), effect_cache)
+            if substitute is not None and not sheet_is_horizontal(
+                    pkg, index, mesh_ref,
+                    tuple(rotation.value) if rotation is not None and rotation.value
+                    else (0, 0, 0), effect_cache):
+                substitute = None
+            if substitute is None:
+                stats.skipped_effects += 1
+                continue
+            stats.substituted_effects += 1
+        elif texture_set is not None:
+            # Not an effect, but water is procedural in UT3 too -- tint,
+            # refraction and fresnel are all shader parameters, and the only
+            # texture in the graph is a detail normal map. CTF-LostCause's pool
+            # is the case: refuse the normal map and the sheet is flat grey.
+            rotation = props.get("Rotation")
+            substitute = water_substitute(
+                pkg, index, mesh_ref, _material_overrides(pkg, comp),
+                tuple(rotation.value) if rotation is not None and rotation.value
+                else (0, 0, 0), texture_set, effect_cache)
+            if substitute is not None:
+                stats.substituted_water += 1
+        mesh_name = mesh_set.add(pkg, index, mesh_ref, _material_overrides(pkg, comp))
+        if mesh_name is None:
+            stats.skipped_no_mesh += 1
+            continue
+
+        properties = [("StaticMesh", "StaticMesh'%s.%s'" % (mesh_set.package_name, mesh_name))]
+        placed_rot, placed_scale3d, comp_offset = _effective_transform(props, comp)
+        if any(comp_offset) or tuple(props.get("Rotation").value if props.get("Rotation") is not None
+                                     and props.get("Rotation").value else (0, 0, 0)) != placed_rot:
+            stats.component_transforms += 1
+        location = props.get("Location")
+        if location is not None and location.value:
+            world = [location.value[i] + comp_offset[i] for i in range(3)]
+            properties.append(("Location", vec([c * scale for c in world])))
+        elif any(comp_offset):
+            properties.append(("Location", vec([c * scale for c in comp_offset])))
+        if any(placed_rot):
+            properties.append(("Rotation", rot(placed_rot)))
+        draw_scale = props.get("DrawScale", 1.0)
+        if draw_scale != 1.0:
+            properties.append(("DrawScale", "%f" % draw_scale))
+        if placed_scale3d != (1.0, 1.0, 1.0):
+            properties.append(("DrawScale3D", vec(placed_scale3d)))
+        pre_pivot = props.get("PrePivot")
+        if pre_pivot is not None and pre_pivot.value and any(pre_pivot.value):
+            properties.append(("PrePivot", vec([c * scale for c in pre_pivot.value])))
+        if substitute is not None:
+            # Overrides whatever the exported mesh carries, so the ASE's own
+            # texture is irrelevant here.
+            properties.append(("Skins(0)", substitute))
+        if _collision_off(props, comp) or export.name in no_collision:
+            properties.extend([("bCollideActors", "False"), ("bBlockActors", "False"),
+                               ("bBlockKarma", "False")])
+            stats.non_colliding += 1
+        elif props.get("bBlockActors") is False:
+            properties.extend([("bBlockActors", "False"), ("bBlockKarma", "False")])
+            stats.non_blocking += 1
+
+        name = sanitize(export.name)
+        if name in names:
+            n = 2
+            while "%s_%d" % (name, n) in names:
+                n += 1
+            name = "%s_%d" % (name, n)
+        names.add(name)
+        emitted = Actor("StaticMeshActor", name, properties)
+        # Remember what it was in UT3: only plain scenery may be relocated into
+        # the skybox, never a mover staged off-map.
+        emitted.source_class = source_class
+        out.append(emitted)
+        stats.actor_mesh_names.append(mesh_name)
+        stats.actors += 1
+    return out, stats
+
+
+def export_meshes(mesh_set, out_dir, index, texture_set=None, scale=1.0,
+                  group="Meshes", stats=None):
+    """Write an ASE per mesh; returns the #exec lines to add to the package."""
+    stats = stats or MeshStats()
+    package = mesh_set.package_name
+    meshes_dir = os.path.join(out_dir, package, "Meshes")
+    os.makedirs(meshes_dir, exist_ok=True)
+
+    lines = []
+    counts = {}
+    for name in sorted(mesh_set.meshes):
+        owner, export, overrides = mesh_set.meshes[name]
+        mesh = read_static_mesh(owner, export)
+        if mesh is None:
+            stats.skipped_unreadable += 1
+            stats.failed.append((name, "unreadable"))
+            continue
+        ok, why = validate(mesh)
+        if not ok:
+            stats.skipped_unreadable += 1
+            stats.failed.append((name, why))
+            continue
+        lod = mesh.lod0
+
+        # Element -> material index, and the texture each one resolves to.
+        textures = []
+        face_material = {}
+        for material_index, element in enumerate(lod.elements):
+            texture_name = None
+            # The component's override wins: UT3 uses it to dress one mesh
+            # differently per actor, and the mesh's own material is often a
+            # placeholder that resolves to something meaningless like a cubemap.
+            material = element.material
+            if material_index < len(overrides) and overrides[material_index] is not None:
+                material = overrides[material_index]
+            if texture_set is not None:
+                resolved = texture_set.add_material(owner, index, material)
+                texture_name = resolved
+            textures.append(texture_name or texture_set.FALLBACK_NAME if texture_set else None)
+            for t in range(element.num_triangles):
+                face_material[element.first_index // 3 + t] = material_index
+
+        faces = []
+        for face_index, (a, b, c) in enumerate(lod.triangles):
+            faces.append((a, b, c, face_material.get(face_index, 0)))
+
+        # UE3 meshes can carry several UV sets and the material says which one
+        # to sample; UT2004 stores only one, so bake the chosen set per element.
+        # UT3's sky dome is the case that matters: channel 0 is a polar map that
+        # collapses every apex vertex onto one line of the texture, channel 1 is
+        # the disc projection its material actually reads.
+        uvs = list(lod.uvs) if len(lod.uvs) == len(lod.positions) else []
+        if uvs:
+            for element in lod.elements:
+                channel, u_tiling, v_tiling = material_uv_channel(
+                    owner, index, element.material)
+                if channel == 0 and u_tiling == 1.0 and v_tiling == 1.0:
+                    continue
+                source = lod.uv_sets[channel] if channel < len(lod.uv_sets) else lod.uvs
+                if len(source) != len(uvs):
+                    continue
+                # Which vertices the element covers has to come from its own
+                # triangles: the declared MaxVertexIndex is not dependable (the
+                # sky dome reports 295 for a 592-vertex mesh).
+                first = element.first_index
+                for v in lod.indices[first:first + element.num_triangles * 3]:
+                    if v < len(uvs):
+                        u, w = source[v]
+                        uvs[v] = (u * u_tiling, w * v_tiling)
+                if channel:
+                    stats.uv_channels[name] = channel
+        path = write_ase(os.path.join(meshes_dir, "%s.ase" % name), name,
+                         lod.positions, uvs, faces, textures, scale=scale)
+        # NOT "#exec STATICMESH IMPORT": that handler only accepts LightWave
+        # .lwo (Editor/Src/UnEdSrvExecImporters.cpp:426). ASE is handled by
+        # UStaticMeshFactory, which registers the "ase" format
+        # (Editor/Src/UnStaticMesh.cpp:415), reached through the generic
+        # factory exec (UnEdSrv.cpp:436).
+        lines.append("#exec NEW STANDALONE StaticMeshFactory FILE=Meshes\\%s NAME=%s PACKAGE=%s"
+                     % (os.path.basename(path), name, package))
+        stats.meshes += 1
+        stats.triangles += len(faces)
+        counts[name] = len(faces)
+    stats.mesh_triangle_counts = counts
+    stats.scene_triangles = sum(counts.get(n, 0) for n in stats.actor_mesh_names)
+    return lines, stats
