@@ -10,6 +10,19 @@ import struct
 
 from .package import Reader
 
+# How far into an export to look for the start of its tagged-property list.
+# It follows whatever the class serializes natively, and that prefix is bigger
+# in UDK than in UT3: a TOXIKK Brush puts its list at +66 where a UT3 one is
+# within the first few bytes. Widening the search costs a few rejected offsets
+# on exports that have no properties at all.
+PROPERTY_SCAN_WINDOW = 256
+
+# Package version from which a ByteProperty tag carries its enum's name and a
+# BoolProperty's value is one byte rather than four. UT3 (512) does neither and
+# TOXIKK's UDK (868) does both; the version in between was not established, so
+# this keeps every UT3 map on the format measured against it.
+UDK_TAG_CHANGES = 584
+
 # Structs with native serializers, i.e. plain binary rather than tagged properties.
 _STRUCT_SIZES = {
     "Vector": 12,
@@ -173,6 +186,12 @@ def read_properties(pkg, r, limit=None):
         struct_name = None
         if type_name == "StructProperty":
             struct_name = pkg.fname(r)
+        elif type_name == "ByteProperty" and pkg.version >= UDK_TAG_CHANGES:
+            # UDK names the enum in the tag, the way a struct is named. Reading
+            # past it is what stopped a TOXIKK StaticMeshComponent from parsing:
+            # its list ends four properties early, before the StaticMesh that
+            # every mesh actor is found through.
+            pkg.fname(r)
 
         start = r.p
         if type_name == "IntProperty":
@@ -181,7 +200,8 @@ def read_properties(pkg, r, limit=None):
             value = r.f32()
         elif type_name == "BoolProperty":
             # UT3 (v512): Size is 0 and the value follows the tag as an INT.
-            value = r.i32() != 0
+            # UDK narrows that to a single byte.
+            value = (r.u8() if pkg.version >= UDK_TAG_CHANGES else r.i32()) != 0
             props.add(name, array_index, type_name, value)
             continue
         elif type_name == "ByteProperty":
@@ -258,7 +278,22 @@ def find_property_start(pkg, data):
 def read_object_properties(pkg, export):
     """Read the tagged properties of an export. Returns (Properties, start, end)."""
     data = pkg.export_data(export)
-    for pos in range(0, min(len(data), 64), 4):
+    window = min(len(data), PROPERTY_SCAN_WINDOW)
+    # An object's property list follows whatever its class serializes natively,
+    # so where it starts has to be found rather than assumed. Aligned offsets
+    # first, which is where every UT3 export puts it and keeps that search
+    # exactly as cheap as it was.
+    for pos in range(0, window, 4):
+        parsed = _try_parse(pkg, data, pos)
+        if parsed:
+            return parsed[0], pos, parsed[1]
+    # Then the unaligned ones. UDK packages need this: a TOXIKK StaticMeshActor
+    # carries a 26-byte native prefix, so its properties begin two bytes off
+    # every multiple of four. _try_parse walks the whole list to its None
+    # terminator before accepting an offset, so a false start does not survive.
+    for pos in range(1, window):
+        if pos % 4 == 0:
+            continue
         parsed = _try_parse(pkg, data, pos)
         if parsed:
             return parsed[0], pos, parsed[1]

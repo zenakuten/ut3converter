@@ -1,0 +1,13 @@
+# Python bytecode, which appears the moment anything here is run or imported.
+__pycache__/
+*.pyc
+
+# Converter output. batch.py writes out-<map>/<Name>.t3d beside the scripts
+# (batch.py, run()), and a single ut3conv.py run does the same wherever -o
+# points. Regenerable, and large.
+out-*/
+
+# Packaged build artifacts. Regenerable from a build, and binary.
+releases/
+
+# gui/ has its own .gitignore for build/ and build-win/.

@@ -1,0 +1,11 @@
+{
+  "name": "ut3convgui",
+  "version": "1.0.0",
+  "dependencies": [
+    {
+      "name": "imgui",
+      "features": ["sdl3-binding", "sdl3-renderer-binding"]
+    },
+    "sdl3"
+  ]
+}

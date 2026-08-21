@@ -19,6 +19,13 @@ COMPRESS_LZX = 0x04
 
 PACKAGE_TAG = 0x9E2A83C1
 
+# Package versions at which UE3's header and export table changed shape. Both
+# were found by reading a TOXIKK map (UDK 868) against a UT3 one (512) and
+# checking that every table ends exactly where the next one begins; the exact
+# version each landed at is not known, only that 512 is before and 868 after.
+UDK_EXTRA_OFFSETS = 584
+UDK_NO_COMPONENT_MAP = 639
+
 _lzo = None
 
 
@@ -207,6 +214,12 @@ class Package:
         self.import_count = r.i32()
         self.import_offset = r.i32()
         self.depends_offset = r.i32()
+        # UDK (868) carries four more offsets here that UT3 (512) does not: the
+        # import/export GUID table, its two counts, and the thumbnail table.
+        # Skipping them is what lets a TOXIKK .udk read with the same code --
+        # every table then lands exactly where the header says it does.
+        if self.version >= UDK_EXTRA_OFFSETS:
+            r.p += 16
         self.guid = r.bytes(16)
         gens = r.i32()
         r.p += gens * 12  # export count, name count, net object count
@@ -321,11 +334,14 @@ class Package:
             offset = r.i32()
             # UT3 keeps a TMap<FName,INT> of the object's components here. The
             # values are 0-based export indices, so bump them to PackageIndex.
-            n_components = r.i32()
+            # UE3 dropped the map later on, so a UDK package has no such field
+            # and reading one would consume the export flags instead.
             components = {}
-            for _ in range(n_components):
-                comp_name = self.fname(r)
-                components[comp_name] = r.i32() + 1
+            if self.version < UDK_NO_COMPONENT_MAP:
+                n_components = r.i32()
+                for _ in range(n_components):
+                    comp_name = self.fname(r)
+                    components[comp_name] = r.i32() + 1
             export_flags = r.u32()
             n_net_objects = r.i32()
             r.p += n_net_objects * 4

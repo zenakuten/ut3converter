@@ -25,6 +25,17 @@ import struct
 
 from ..props import read_object_properties
 
+# Package version at which an FPoly grew its Lightmass settings and ruleset
+# name. UT3 (512) has neither and TOXIKK's UDK (868) has both; the exact
+# version in between was not established, so this is the earliest that keeps
+# every UT3 map reading the way it did.
+UDK_FPOLY_EXTRAS = 584
+# bUseTwoSidedLighting, bShadowIndirectOnly, FullyOccludedSamplesFraction,
+# bUseEmissiveForStaticLighting, EmissiveLightFalloffExponent,
+# EmissiveLightExplicitInfluenceRadius, EmissiveBoost, DiffuseBoost,
+# SpecularBoost -- nine 4-byte fields.
+LIGHTMASS_SETTINGS_SIZE = 36
+
 
 class Poly:
     __slots__ = (
@@ -91,6 +102,14 @@ def read_polys(pkg, export):
         brush_poly = r.i32()
         shadow_map_scale = r.f32()
         lighting_channels = r.u32()
+        if pkg.version >= UDK_FPOLY_EXTRAS:
+            # UDK adds FLightmassPrimitiveSettings -- nine fields, two-sided
+            # lighting through to the specular boost -- and the FName of the
+            # procedural-building ruleset variation. Neither has any meaning in
+            # UE2, so both are skipped; what matters is the stride, since
+            # reading a poly short walks into the middle of the next one.
+            r.p += LIGHTMASS_SETTINGS_SIZE
+            pkg.fname(r)
         polys.append(
             Poly(
                 base=base,

@@ -75,7 +75,8 @@ def is_builder_brush(pkg, export, props=None):
     which is the builder brush's own value, so a real brush always serializes an
     explicit CSG_Add or CSG_Subtract and the builder never serializes anything.
     Across the 55 stock maps that picks out exactly one brush per map, no more
-    and no fewer.
+    and no fewer -- and the same holds for a TOXIKK UDK map, 83 additive and 68
+    subtractive brushes with one template among them.
 
     The model name is the weaker one and only a partial signal: the builder's
     model is sometimes named "Brush" where a real brush's is "Model_<n>", but in
@@ -89,6 +90,11 @@ def is_builder_brush(pkg, export, props=None):
         props, start, _end = read_object_properties(pkg, export)
         if start is None:
             return False
+    # Absence only means anything when the list was read. An export whose
+    # properties could not be parsed at all has no CsgOper either, and calling
+    # that the builder brush deletes real geometry.
+    if not len(props):
+        return False
     if props.get("CsgOper") is None:
         return True
     model = props.get("Brush")

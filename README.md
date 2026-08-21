@@ -108,6 +108,42 @@ then:
    reachspecs and jump velocities, so bots have no paths until you do.
 2. Save as `<UT2004>/Maps/DM-Deck.ut2`.
 
+## Doing it in bulk
+
+`batch.py` does all of the above for every map, one package per build, rewriting
+`EditPackages` between its own markers each time so your own entries survive.
+Set `UT3_ROOT` and `EDITOR` at the top of the script first — your UT3 `CookedPC`
+folder, and your UT2004 install.
+
+**Windows**
+
+```
+python batch.py --list
+python batch.py --match Deck
+python batch.py --match Deck --build
+python batch.py --build
+```
+
+**Linux**
+
+```bash
+./batch.py --list                   # what would be converted
+./batch.py --match Deck             # convert, no build
+./batch.py --match Deck --build     # ...and build it
+./batch.py --build                  # all 55
+```
+
+Results land as `out-<map>/<Name>.t3d`, `<UT2004>/<Pkg>Tex/`,
+`<UT2004>/System/<Pkg>Tex.u` and `<UT2004>/Textures/<Pkg>.utx`, with every t3d
+copied to `<UT2004>/Converted/` ready to import.
+
+## A window instead
+
+`gui/` is a small SDL3 + Dear ImGui front end over both scripts, if you would
+rather not assemble a fifty-flag command line by hand. It runs the same
+commands documented here, shows the full command line before it runs anything,
+and streams the output back. See `gui/README.md` for building it.
+
 ## Options worth knowing
 
 Everything below is a flag on the `t3d` subcommand; `ut3conv.py t3d --help`
@@ -183,4 +219,5 @@ python3 tests/test_geometry.py      # one of 15, tests/test_*.py
 ```
 
 They read the stock UT3 maps from the Steam install, so they are regression
-tests against real data rather than fixtures. `FORMAT.md` documents the UE3 structures that were reversed.
+tests against real data rather than fixtures. `PLAN.md` records how each phase
+was built and why; `FORMAT.md` documents the UE3 structures that were reversed.

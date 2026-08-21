@@ -857,7 +857,13 @@ def cmd_imports(args):
             break
 
 
-def main(argv=None):
+def build_parser():
+    """The full command line, as its own function so the GUI can read it.
+
+    ut3convgui.py builds its widgets by walking these actions -- names,
+    defaults, types and help text all come from here, so a flag added below
+    shows up in the GUI without touching it.
+    """
     ap = argparse.ArgumentParser(prog="ut3conv", description=__doc__)
     sub = ap.add_subparsers(dest="command", required=True)
 
@@ -1020,7 +1026,11 @@ def main(argv=None):
     sp.add_argument("-n", "--number", type=int, default=50)
     sp.set_defaults(func=cmd_imports)
 
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
     return args.func(args)
 
 
