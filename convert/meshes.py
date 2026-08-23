@@ -12,6 +12,7 @@ import struct
 
 from ut2.ase import write_ase
 from ut2.t3d import Actor, rot, vec
+from convert import collections
 from convert.rotation import axis_images, multiply, rotate, rotation_matrix, to_rotator
 from convert.shaders import (effect_is_drawable, effect_substitute, mesh_is_effect,
                              sheet_is_horizontal, water_substitute)
@@ -316,6 +317,25 @@ def _effective_transform(props, comp):
     return rotation, scale3d, offset
 
 
+def _actor_sources(pkg):
+    """Every placeable mesh, as (export, source class, properties, component).
+
+    Two shapes reach the same emitter. UT3 and UDK write one actor per mesh, so
+    the actor carries the transform and points at a component. Gears bundles
+    them into StaticMeshCollectionActors, where the transform is a matrix in
+    the collection and the component is the only thing named -- see
+    convert/collections.py. Both arrive here looking alike.
+    """
+    for export in ordered_exports(pkg, ACTOR_CLASSES):
+        props, start, _end = read_object_properties(pkg, export)
+        if start is None:
+            continue
+        yield (export, pkg.class_name_of(export), props,
+               _component_of(pkg, export, props))
+    for entry in collections.expand(pkg):
+        yield entry
+
+
 def convert_actors(pkg, index, mesh_set, texture_set=None, scale=1.0, stats=None,
                    skip_effects=True, skip=(), no_collision=()):
     """Collect static mesh actors and emit t3d StaticMeshActors.
@@ -330,14 +350,9 @@ def convert_actors(pkg, index, mesh_set, texture_set=None, scale=1.0, stats=None
     names = set()
     effect_cache = {}
     skip = set(skip)
-    for export in ordered_exports(pkg, ACTOR_CLASSES):
+    for export, source_class, props, comp in _actor_sources(pkg):
         if export.name in skip:
             continue
-        source_class = pkg.class_name_of(export)
-        props, start, _end = read_object_properties(pkg, export)
-        if start is None:
-            continue
-        comp = _component_of(pkg, export, props)
         if comp is None:
             stats.skipped_no_mesh += 1
             continue

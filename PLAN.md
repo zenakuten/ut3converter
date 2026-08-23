@@ -1561,6 +1561,63 @@ differently:
 
 So this is a working reader for a third UE3 dialect, not yet a converted map.
 
+**Phase 17 -- Gears converts. Four more thresholds fall.** MP_Courtyard now
+comes out with 669 static meshes placing 2,513,028 triangles, 93 lights and 44
+player starts, where Phase 15 left it at 12 actors, no lights and no starts.
+
+*The collection actors.* Gears cooks scenery in bundles: 34
+StaticMeshCollectionActors holding 3,362 StaticMeshComponents, and one
+StaticLightCollectionActor holding all 118 lights. Both are laid out the same
+way -- an array of component references in the tagged properties, then one
+FMatrix per entry filling the rest of the export -- so `convert/collections.py`
+walks them once and hands each component to the existing emitters shaped like
+an actor. Nothing in meshes.py or lights.py had to learn about collections
+beyond where its input comes from.
+
+Each matrix decomposes exactly: row lengths are the scale, normalised rows the
+rotation, fourth row the translation. Round-tripping the recovered rotator back
+through `rotation_matrix` on all 3,362 components reproduces the original basis
+to 5e-07. The matrix is the *whole* transform, so the component's own
+Translation/Rotation/Scale are stripped before the emitter folds a component
+into its actor -- otherwise they apply twice.
+
+*Four more version thresholds, all wrong for 835.* Phase 15 said every
+threshold in this reader was a guess from two data points. That was still true
+of four more:
+
+* **The property-tag dialect.** How wide a BoolProperty's value is, and whether
+  a ByteProperty names its enum in the tag. UT3 writes four bytes and no name,
+  UDK one byte and the name; Gears sits between them by version and follows UT3
+  on both. Reading one-byte bools desynchronised the stream at the first bool,
+  and `StaticMesh` came out of 304 of 3,381 components instead of 3,377. Now
+  measured per package by scoring the four combinations over a sample of
+  exports -- the wrong dialect dies at the first tag it misreads, so the count
+  separates them eleven to one. It also lifted this map's BSP from 492 polygons
+  to 1,018 and its volumes from 82 to 168.
+* **Three StaticMesh layout flags**, which were one version flag. Gears writes
+  the kDOP root bound like UDK, but no per-element Fragments array and no
+  vertex-colour elision -- like UT3. Neither pure path read a single one of its
+  852 meshes. They are now three independent traits probed as a combination and
+  cached once a mesh reads.
+* **The UV offset** is no longer guessed at all. The vertex stride and the UV
+  count are both in the buffer's own header, so what precedes the UVs is
+  arithmetic: `elem_size - num_texcoords * uv_stride`. Gears' 20-byte vertices
+  with two 4-byte sets give 12, UT3's number.
+
+*An OOM, not a parse failure.* `_array` read a bulk-array header and trusted
+it. While *searching* for the LOD table those two numbers are arbitrary, and a
+count in the hundreds of millions became a list comprehension that took the
+process out -- exit 137, no traceback, on a machine with 83GB free. The header
+now has to fit the export, and a zero element size is rejected explicitly since
+`0 * count` fits anything.
+
+*What is not done.* Gears splits a map across several .war files -- audio, VFX
+and lighting sub-levels beside the base -- and nothing merges them.
+MP_Courtyard keeps everything in the base file so it loses nothing, but
+MP_Depot and MP_Escalation keep their lighting in a `_Lighting` sub-level and
+would come out unlit. `batch.py` lists the 29 base maps and skips the
+sub-levels rather than converting them into empty shells.
+
 **Phase 16 -- packaging a built map for a server.** `tools/package_maps.py`.
 Converting and building a map leaves it in two places the editor uses; shipping
 it needs four files in one folder -- the `.ut2`, its `.utx`, and a `.uz2` of

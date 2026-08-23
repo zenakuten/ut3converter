@@ -19,6 +19,7 @@ import colorsys
 import math
 
 from ut2.t3d import Actor, vec, rot
+from convert import collections
 from ut3.objects.level import is_placed_actor
 from ut3.props import read_object_properties
 
@@ -147,22 +148,38 @@ def _component_props(pkg, export, props):
     return None
 
 
+def _light_sources(pkg):
+    """Every light, as (export, UE3 class, collected). 
+
+    `collected` is None for a real light actor -- the loop reads its properties
+    itself -- and (properties, component) for one lifted out of a
+    StaticLightCollectionActor, where the transform is a matrix in the
+    collection rather than a property on an actor. See convert/collections.py.
+    """
+    for export in pkg.exports:
+        yield export, pkg.class_name_of(export), None
+    for export, cls, props, comp in collections.expand_lights(pkg):
+        yield export, cls, (props, comp)
+
+
 def convert_lights(pkg, scale=1.0, gain=DEFAULT_GAIN, radius_scale=1.0,
                    ambient_gain=DEFAULT_AMBIENT_GAIN, stats=None):
     """Convert every supported light actor into a UT2004 Light actor."""
     stats = stats or LightStats()
     out = []
-    for export in pkg.exports:
-        cls = pkg.class_name_of(export)
+    for export, cls, collected in _light_sources(pkg):
         if cls in ("SkyLight", "SkyLightToggleable"):
             # UT2004 has no SkyLight actor. Its equivalent is the zone's ambient
             # term, which lives on LevelInfo (a ZoneInfo subclass) and so cannot
             # be created by a t3d import -- report the values to set by hand.
             stats.unsupported[cls] = stats.unsupported.get(cls, 0) + 1
-            props, start, _end = read_object_properties(pkg, export)
-            if start is None:
-                continue
-            comp = _component_props(pkg, export, props)
+            if collected is not None:
+                _props, comp = collected
+            else:
+                props, start, _end = read_object_properties(pkg, export)
+                if start is None:
+                    continue
+                comp = _component_props(pkg, export, props)
             if comp is None:
                 continue
             brightness = comp.get("Brightness", DEFAULT_BRIGHTNESS)
@@ -190,14 +207,19 @@ def convert_lights(pkg, scale=1.0, gain=DEFAULT_GAIN, radius_scale=1.0,
                     stats.ambient = (total, stats.ambient[1], stats.ambient[2])
                 stats.ambient_parts.append(ambient)
             continue
-        if cls not in LIGHT_CLASSES or not is_placed_actor(pkg, export):
+        if cls not in LIGHT_CLASSES:
+            continue
+        if collected is None and not is_placed_actor(pkg, export):
             continue
         ue2_class, extra = LIGHT_CLASSES[cls]
 
-        props, start, _end = read_object_properties(pkg, export)
-        if start is None:
-            continue
-        comp = _component_props(pkg, export, props)
+        if collected is not None:
+            props, comp = collected
+        else:
+            props, start, _end = read_object_properties(pkg, export)
+            if start is None:
+                continue
+            comp = _component_props(pkg, export, props)
         if comp is None:
             stats.skipped_no_component += 1
             continue

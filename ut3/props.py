@@ -17,11 +17,29 @@ from .package import Reader
 # on exports that have no properties at all.
 PROPERTY_SCAN_WINDOW = 256
 
-# Package version from which a ByteProperty tag carries its enum's name and a
-# BoolProperty's value is one byte rather than four. UT3 (512) does neither and
-# TOXIKK's UDK (868) does both; the version in between was not established, so
-# this keeps every UT3 map on the format measured against it.
-UDK_TAG_CHANGES = 584
+# How a package writes two ambiguous corners of a property tag: how wide a
+# BoolProperty's value is, and whether a ByteProperty names its enum in the tag.
+# UT3 (512) writes a four-byte bool and no enum name; TOXIKK's UDK (868) writes
+# one byte and the name.
+UT3_TAGS = (4, False)
+UDK_TAGS = (1, True)
+
+# This was a version threshold (UDK_TAG_CHANGES = 584), guessed from those two
+# builds because nothing in between had been read. Gears of War Reloaded is
+# version 835 -- between them -- and follows UT3 on *both* counts, so the
+# threshold got it exactly backwards: reading one-byte bools derailed the parse
+# at the first BoolProperty and found StaticMesh on 304 of 3,381
+# StaticMeshComponents instead of 3,377.
+#
+# So the dialect is measured per package instead. The wrong one desynchronises
+# the stream at the first bool or byte and the list dies early, which makes
+# "how many properties come out of a sample of exports" a decisive signal --
+# on MP_Courtyard the right dialect scores eleven times the wrong one.
+_DIALECTS = (UT3_TAGS, UDK_TAGS, (4, True), (1, False))
+
+# Enough exports to separate the dialects without reading half the package.
+_DIALECT_SAMPLE = 120
+_DIALECT_WINDOW = 128
 
 # Structs with native serializers, i.e. plain binary rather than tagged properties.
 _STRUCT_SIZES = {
@@ -170,8 +188,11 @@ def _decode_struct(pkg, type_name, raw):
     return Struct(type_name, None, raw)
 
 
-def read_properties(pkg, r, limit=None):
+def read_properties(pkg, r, limit=None, dialect=None):
     """Read a tagged-property list from `r` until the terminating None."""
+    if dialect is None:
+        dialect = tag_dialect(pkg)
+    bool_width, byte_names_enum = dialect
     props = Properties()
     while True:
         if r.eof:
@@ -186,7 +207,7 @@ def read_properties(pkg, r, limit=None):
         struct_name = None
         if type_name == "StructProperty":
             struct_name = pkg.fname(r)
-        elif type_name == "ByteProperty" and pkg.version >= UDK_TAG_CHANGES:
+        elif type_name == "ByteProperty" and byte_names_enum:
             # UDK names the enum in the tag, the way a struct is named. Reading
             # past it is what stopped a TOXIKK StaticMeshComponent from parsing:
             # its list ends four properties early, before the StaticMesh that
@@ -200,8 +221,9 @@ def read_properties(pkg, r, limit=None):
             value = r.f32()
         elif type_name == "BoolProperty":
             # UT3 (v512): Size is 0 and the value follows the tag as an INT.
-            # UDK narrows that to a single byte.
-            value = (r.u8() if pkg.version >= UDK_TAG_CHANGES else r.i32()) != 0
+            # UDK narrows that to a single byte. Which one this package uses is
+            # measured by tag_dialect(), not inferred from its version.
+            value = (r.u8() if bool_width == 1 else r.i32()) != 0
             props.add(name, array_index, type_name, value)
             continue
         elif type_name == "ByteProperty":
@@ -246,13 +268,13 @@ def _looks_like_tag(pkg, data, pos):
     return pkg.names[ti].endswith("Property")
 
 
-def _try_parse(pkg, data, pos):
+def _try_parse(pkg, data, pos, dialect=None):
     """Parse from `pos`; return (props, end) only if it terminates cleanly."""
     if not _looks_like_tag(pkg, data, pos):
         return None
     r = Reader(data, pos)
     try:
-        props = read_properties(pkg, r)
+        props = read_properties(pkg, r, dialect=dialect)
     except (EOFError, IndexError, struct.error, ValueError):
         return None
     if r.eof and len(props) == 0:
@@ -260,6 +282,52 @@ def _try_parse(pkg, data, pos):
     if r.p > len(data):
         return None
     return props, r.p
+
+
+def _dialect_score(pkg, dialect, exports):
+    """How many properties a sample of exports yields under `dialect`.
+
+    A desynchronised parse dies at the first tag it misreads, so the count
+    separates the dialects sharply. Each export is scanned the same way
+    read_object_properties scans, since where a list starts is independent of
+    how its tags are written.
+    """
+    total = 0
+    for export in exports:
+        data = pkg.export_data(export)
+        for pos in range(min(len(data), _DIALECT_WINDOW)):
+            parsed = _try_parse(pkg, data, pos, dialect=dialect)
+            if parsed:
+                total += len(parsed[0])
+                break
+    return total
+
+
+def tag_dialect(pkg):
+    """Measure how this package writes bool and byte property tags.
+
+    Cached on the package: the answer is a property of the build that wrote it,
+    and the probe reads a sample of exports.
+    """
+    cached = getattr(pkg, "_tag_dialect", None)
+    if cached is not None:
+        return cached
+
+    # Assume the version-implied dialect while probing, so the recursion into
+    # read_properties from _try_parse has something to use. Every call below
+    # passes an explicit dialect, so this only guards against a stray default.
+    default = UDK_TAGS if pkg.version >= 584 else UT3_TAGS
+    pkg._tag_dialect = default
+
+    exports = [e for e in pkg.exports if e.size > 32][:_DIALECT_SAMPLE]
+    if exports:
+        scored = [(_dialect_score(pkg, d, exports), d) for d in _DIALECTS]
+        best = max(scored)[0]
+        # Ties go to the version's own dialect: an undecidable sample should
+        # not move a build off the format it was measured against.
+        winners = [d for score, d in scored if score == best]
+        pkg._tag_dialect = default if default in winners else winners[0]
+    return pkg._tag_dialect
 
 
 def find_property_start(pkg, data):

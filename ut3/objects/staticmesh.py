@@ -33,13 +33,39 @@ unless bUseFullPrecisionUVs is set.
 """
 
 import struct
+from collections import namedtuple
 
 from ..props import read_object_properties
 
 # The package version at which the two UDK-only native fields appear. As with
 # the header offsets in package.py the exact version is not known, only that
-# 512 (UT3) is before and 868 (TOXIKK's UDK) is after.
+# 512 (UT3) is before and 868 (TOXIKK's UDK) is after. Kept only to pick which
+# layout to try first.
 UDK_STATICMESH_EXTRAS = 584
+
+# Three independent things a build may or may not write around the LOD table.
+# They were one version flag until Gears of War Reloaded (835) turned out to
+# mix them: it writes the kDOP root bound like UDK but no per-element Fragments
+# and no vertex-colour payload elision, like UT3. Neither pure path read a
+# single one of MP_Courtyard's 852 meshes.
+#
+#   kdop_bound      24 bytes of Min/Max after the BodySetup reference
+#   element_extras  a Fragments array plus a trailing byte on every element
+#   colour_always   the vertex-colour array header is written even when empty
+#
+# So the combination is measured per package rather than derived from a
+# version, and cached once a mesh reads.
+Layout = namedtuple("Layout", "kdop_bound element_extras colour_always")
+
+UT3_LAYOUT = Layout(kdop_bound=False, element_extras=False, colour_always=True)
+UDK_LAYOUT = Layout(kdop_bound=True, element_extras=True, colour_always=False)
+GEARS_LAYOUT = Layout(kdop_bound=True, element_extras=False, colour_always=True)
+
+_LAYOUTS = (
+    UT3_LAYOUT, UDK_LAYOUT, GEARS_LAYOUT,
+    Layout(True, False, False), Layout(False, True, False),
+    Layout(False, False, False), Layout(False, True, True), Layout(True, True, True),
+)
 
 
 class Element:
@@ -90,15 +116,47 @@ class StaticMesh:
 
 
 def _array(data, o):
-    """Read a bulk-serialized array header: (ElementSize, Count, dataOffset)."""
+    """Read a bulk-serialized array header: (ElementSize, Count, dataOffset).
+
+    Checked against the buffer it is being read from, because this is called
+    while *searching* for the LOD table: at a wrong candidate offset the two
+    numbers are arbitrary, and a count in the hundreds of millions becomes a
+    list comprehension that takes the whole process out rather than failing the
+    candidate. Converting Gears' MP_Courtyard was killed by the OOM reaper here
+    -- no traceback, just exit 137 -- until the header had to fit.
+    """
     elem_size, count = struct.unpack_from("<2i", data, o)
+    # A zero element size passes any "does it fit" test while still asking for
+    # `count` entries, so it has to be rejected explicitly rather than left to
+    # the multiplication.
+    if count > 0 and elem_size <= 0:
+        raise ValueError("array of %d elements with element size %d" % (count, elem_size))
+    if elem_size < 0 or count < 0 or o + 8 + elem_size * count > len(data):
+        raise ValueError("array header %d x %d does not fit the export" % (count, elem_size))
     return elem_size, count, o + 8
 
 
 def read_static_mesh(pkg, export, want_lod=0):
-    """Parse a StaticMesh export. Returns None if the layout does not hold."""
+    """Parse a StaticMesh export, measuring the build's layout if need be.
+
+    The layout that works is a property of the package, so the first mesh that
+    reads settles it for the rest and is tried first from then on.
+    """
     if pkg.class_name_of(export) != "StaticMesh":
         return None
+    cached = getattr(pkg, "_staticmesh_layout", None)
+    order = ([cached] if cached is not None else []) + [
+        l for l in _LAYOUTS if l != cached]
+    for layout in order:
+        mesh = _read_with_layout(pkg, export, want_lod, layout)
+        if mesh is not None:
+            pkg._staticmesh_layout = layout
+            return mesh
+    return None
+
+
+def _read_with_layout(pkg, export, want_lod, layout):
+    """Parse a StaticMesh export. Returns None if the layout does not hold."""
     data = pkg.export_data(export)
     props, start, end = read_object_properties(pkg, export)
     if start is None:
@@ -108,7 +166,7 @@ def read_static_mesh(pkg, export, want_lod=0):
         bounds = struct.unpack_from("<7f", data, o)
         o += 28
         o += 4  # BodySetup
-        if pkg.version >= UDK_STATICMESH_EXTRAS:
+        if layout.kdop_bound:
             o += 24  # the kDOP tree's root bound: Min and Max, no validity byte
 
         for _ in range(2):  # kDOP nodes, kDOP triangles
@@ -117,9 +175,9 @@ def read_static_mesh(pkg, export, want_lod=0):
         after_kdop = o
 
         o += 4  # Version
-        if pkg.version >= UDK_STATICMESH_EXTRAS:
+        if layout.element_extras:
             o += 16
-        lods = _read_lods(pkg, data, o, want_lod)
+        lods = _read_lods(pkg, data, o, want_lod, layout)
         if lods is None:
             # What sits between the kDOP tree and the LOD table is not a fixed
             # length. UDK normally writes sixteen bytes after `Version` --
@@ -134,7 +192,7 @@ def read_static_mesh(pkg, export, want_lod=0):
             for candidate in range(after_kdop, after_kdop + LOD_SEARCH_WINDOW):
                 if candidate == o:
                     continue
-                lods = _read_lods(pkg, data, candidate, want_lod)
+                lods = _read_lods(pkg, data, candidate, want_lod, layout)
                 if lods is not None:
                     break
         if lods is None:
@@ -151,7 +209,7 @@ def read_static_mesh(pkg, export, want_lod=0):
 LOD_SEARCH_WINDOW = 4096
 
 
-def _read_lods(pkg, data, o, want_lod):
+def _read_lods(pkg, data, o, want_lod, layout):
     """Parse the LOD table at `o`, or None if it does not hold together."""
     try:
         lod_count = struct.unpack_from("<i", data, o)[0]
@@ -176,7 +234,7 @@ def _read_lods(pkg, data, o, want_lod):
                     "<9i", data, o
                 )
                 o += 36
-                if pkg.version >= UDK_STATICMESH_EXTRAS:
+                if layout.element_extras:
                     # TArray<FFragmentRange> Fragments, then a one-byte
                     # bUsesFragments. Every stock mesh carries exactly one
                     # fragment spanning the whole element, so the array is
@@ -207,13 +265,20 @@ def _read_lods(pkg, data, o, want_lod):
             # in channel 0 and a flat one in channel 1 -- so read them all and
             # let the caller choose. They are interleaved per vertex, after the
             # three packed normals.
-            # UT3 puts three packed normals ahead of the UVs; UDK writes two,
-            # so its UV block starts four bytes earlier. Reading a UDK mesh at
-            # 12 does not fail -- on a two-channel mesh it silently returns the
-            # lightmap UVs instead of the diffuse ones.
-            uv_offset = 8 if pkg.version >= UDK_STATICMESH_EXTRAS else 12
             uv_format = "<2f" if full_precision else "<2e"
             uv_stride = 8 if full_precision else 4
+            # UT3 puts three packed normals ahead of the UVs and UDK two, so a
+            # UDK block starts four bytes earlier. Reading a UDK mesh at 12
+            # does not fail -- on a two-channel mesh it silently returns the
+            # lightmap UVs instead of the diffuse ones -- so this was worth
+            # more than a version guess. The vertex stride and the UV count are
+            # both in the buffer's own header, which makes the offset
+            # arithmetic: whatever the UVs do not occupy is what precedes them.
+            # Gears writes 20-byte vertices with two 4-byte UV sets, i.e.
+            # UT3's twelve.
+            derived = elem_size - max(1, num_texcoords) * uv_stride
+            uv_offset = derived if derived >= 0 else (
+                8 if pkg.version >= UDK_STATICMESH_EXTRAS else 12)
             uv_sets = []
             for channel in range(max(1, num_texcoords)):
                 base_offset = o + uv_offset + channel * uv_stride
@@ -230,7 +295,7 @@ def _read_lods(pkg, data, o, want_lod):
             # empty or not, so the skip stays unconditional there.
             _stride, colour_vertices = struct.unpack_from("<2i", data, o)
             o += 8
-            if colour_vertices > 0 or pkg.version < UDK_STATICMESH_EXTRAS:
+            if colour_vertices > 0 or layout.colour_always:
                 elem_size, count, o = _array(data, o)
                 o += elem_size * count
 

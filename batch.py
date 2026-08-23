@@ -78,6 +78,15 @@ if UDK_ENGINE is None:
 if os.path.isdir(UDK_ENGINE) and "UT3CONV_EXTRA_CONTENT" not in os.environ:
     os.environ["UT3CONV_EXTRA_CONTENT"] = UDK_ENGINE
 
+# Gears of War Reloaded, a third UE3 dialect (version 835, licensee 76, LZ4).
+# Its maps are cooked, so unlike UDK they carry their assets and need no
+# separate content root.
+GEARS_ROOT = os.environ.get("UT3CONV_GEARS_ROOT")
+if GEARS_ROOT is None:
+    GEARS_ROOT = os.path.expanduser(
+        "~/.steam/steam/steamapps/common/Gears of War Reloaded/WarGame/CookedPC/"
+        "Maps/MP_Maps")
+
 # Not maps: the front end, the intro cinematic and the tutorials.
 SKIP_PREFIXES = ("UTFrontEnd", "EnvyEntry", "UTM-", "UTCin",
                  # TOXIKK's front end and the UDK template map.
@@ -96,6 +105,19 @@ SKIP_MAP_DIRS = ("UT3", "Examples", "Mobile", "Showcases", "First")
 # brushes) and each costs a full package, so they are skipped unless asked for.
 VARIANT_SUFFIXES = ("_SP", "_Necris", "_Leviathan")
 
+# Gears splits a map across several .war files: MP_Courtyard.war is the level,
+# and MP_Courtyard_Audio, _VFX and _Screenshots sit beside it as streaming
+# sub-levels. Only the base file is a map. The _LOC_* files are localised
+# variants of one level and _2v2 and _Stitching alternate cuts -- those convert
+# on their own, so they stay listed, but a sub-level would come out an empty
+# shell.
+#
+# Nothing here merges a sub-level into its parent. MP_Courtyard keeps its 118
+# lights and all 3,362 meshes in the base file, so it loses nothing; a map
+# whose lighting lives in a _Lighting file (MP_Depot, MP_Escalation) would.
+GEARS_SUBLEVEL_SUFFIXES = ("_Audio", "_Screenshots", "_VFX", "_Lighting",
+                           "_Static_Lighting", "_S01", "_S02")
+
 # UT3's Warfare is UT2004's Onslaught, and the map prefix has to say so or the
 # game will not list it.
 # TOXIKK's BloodLust is deathmatch under another name, and a map whose prefix
@@ -105,7 +127,7 @@ VARIANT_SUFFIXES = ("_SP", "_Necris", "_Leviathan")
 # both land on DM- -- which is not just a fallback: a CC map's team-assigned
 # PlayerStarts are exactly what UT2004's Team Deathmatch wants, and a map left
 # under an unknown prefix appears in no gametype's list at all.
-PREFIX_MAP = {"WAR-": "ONS-", "BL-": "DM-", "CC-": "DM-"}
+PREFIX_MAP = {"WAR-": "ONS-", "BL-": "DM-", "CC-": "DM-", "MP_": "DM-"}
 
 # Where a converted name would land on a map that already exists. Only Torlan
 # does: UT2004 ships its own ONS-Torlan, and both would claim the same file.
@@ -137,6 +159,11 @@ EXTRA_FLAGS = {
     # live ones and a Sunlight for a daylight jungle map, and everything else is
     # baked. As little placed lighting as BL-Cube has.
     "BL-Ganesha": ["--ambient", "96"],
+    # Gears keeps its lights in a StaticLightCollectionActor: 118 of them, 93
+    # converting and 87 of those spotlights, so most of the map's own lighting
+    # survives. No SkyLight, though, so it still needs a floor -- a starting
+    # value, not a measured one; this map has not been walked yet.
+    "MP_Courtyard": ["--ambient", "32"],
 }
 
 # Warfare maps carry countdown nodes and standalone nodes that only the
@@ -176,6 +203,8 @@ def discover(variants=False):
     sources = [(UT3_ROOT, "*.ut3")]
     if UDK_ROOT:
         sources.append((UDK_ROOT, "*.udk"))
+    if GEARS_ROOT:
+        sources.append((GEARS_ROOT, "*.war"))
     paths = []
     for root, pattern in sources:
         if root and os.path.isdir(root):
@@ -186,6 +215,8 @@ def discover(variants=False):
         if any(base == s or base.startswith(s) for s in SKIP_PREFIXES):
             continue
         if not variants and base.endswith(VARIANT_SUFFIXES):
+            continue
+        if base.endswith(GEARS_SUBLEVEL_SUFFIXES):
             continue
         if os.path.basename(os.path.dirname(path)) in SKIP_MAP_DIRS:
             continue

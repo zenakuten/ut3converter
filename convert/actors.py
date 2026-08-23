@@ -25,6 +25,12 @@ PLAYER_START_CLASSES = {
     # a power node claims the ordinary PlayerStarts nearest to it -- so this is
     # a plain start placed where UT3 put it.
     "UTWarfarePlayerStart": "PlayerStart",
+    # Gears of War Reloaded names its spawns after its own modes. Wingman is a
+    # five-team two-player mode, so its starts are team-assigned like the
+    # others; UT2004 reads the team off each actor's TeamNumber either way, so
+    # both convert to a plain PlayerStart and keep whatever team they carry.
+    "WarTeamPlayerStart": "PlayerStart",
+    "WarTeamPlayerStart_Wingman": "PlayerStart",
 }
 
 
