@@ -12,7 +12,7 @@ import os
 class PackageIndex:
     """Finds and caches packages by name across a UT3 installation."""
 
-    EXTENSIONS = (".upk", ".ut3", ".u")
+    EXTENSIONS = (".upk", ".ut3", ".udk", ".u")
 
     def __init__(self, roots):
         if isinstance(roots, str):
@@ -21,16 +21,33 @@ class PackageIndex:
         self._paths = None
         self._packages = {}
 
+    # The directory a game keeps its packages under. UT3 cooks everything into
+    # CookedPC; UDK ships uncooked maps under Content alongside the .upk files
+    # they reference, so a TOXIKK map two directories down from Content needs
+    # the whole tree indexed or none of its meshes or textures resolve.
+    CONTENT_ROOTS = ("CookedPC", "Content")
+
+    # Content a game references but does not ship. UDK's own Engine/Content --
+    # EditorMeshes, EngineVolumetrics, EngineMeshes -- lives in the UDK
+    # installation, not the game, so a map placing EditorMeshes.TexPropPlane
+    # resolves to nothing without it. Point UT3CONV_EXTRA_CONTENT at those
+    # trees, separated like PATH, to search them as well.
+    EXTRA_ROOTS = tuple(
+        d for d in os.environ.get("UT3CONV_EXTRA_CONTENT", "").split(os.pathsep)
+        if d and os.path.isdir(d)
+    )
+
     @classmethod
     def for_map(cls, map_path):
-        """Index the CookedPC tree containing `map_path`."""
+        """Index the content tree containing `map_path`."""
         d = os.path.dirname(os.path.abspath(map_path))
-        while d and os.path.basename(d) != "CookedPC":
+        while d and os.path.basename(d) not in cls.CONTENT_ROOTS:
             parent = os.path.dirname(d)
             if parent == d:
-                return cls([os.path.dirname(os.path.abspath(map_path))])
+                return cls([os.path.dirname(os.path.abspath(map_path))]
+                           + list(cls.EXTRA_ROOTS))
             d = parent
-        return cls([d])
+        return cls([d] + list(cls.EXTRA_ROOTS))
 
     @property
     def paths(self):
@@ -81,9 +98,18 @@ class PackageIndex:
         """
         if ref is None or ref.is_null:
             return None, None
+        # An index only means something in the table it was read from, and a
+        # reference does not have to come from `pkg`: following an archetype
+        # chain reads properties out of whatever package defines the archetype,
+        # so the ref handed back belongs to that one. `ObjRef` carries its own
+        # package, and that is the authority; `pkg` is a fallback for a ref
+        # built without one. Resolving a UA_Lights_01 export index against
+        # BL-Foundation returned that map's export 463 -- an unrelated fog
+        # component where a lamp mesh should have been, 48 times over.
+        owner_pkg = ref.pkg or pkg
         if ref.is_export:
-            return pkg, ref.export
-        path = pkg.path_of(ref.index)
+            return owner_pkg, ref.export
+        path = owner_pkg.path_of(ref.index)
         parts = path.split(".")
         if len(parts) < 2:
             return None, None

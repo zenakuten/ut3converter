@@ -193,7 +193,7 @@ def clean_package(out_dir, package):
 def _build_assets(p, package_path, texture_package, out_dir, max_size, with_meshes, scale,
                   skip_effects, with_terrain, layer_scale, no_skybox, with_sounds=True,
                   sound_gain=1.0, with_movers=True, max_keys=24, no_collision=(),
-                  deco_density=None):
+                  deco_density=None, with_materials=True):
     """Extract textures (and optionally static meshes) into one buildable package."""
     from convert.textures import TextureSet, collect_brush_materials, export_textures
     from ut3.resolve import PackageIndex
@@ -203,7 +203,7 @@ def _build_assets(p, package_path, texture_package, out_dir, max_size, with_mesh
         print("  cleared %d file(s) from the previous build" % stale)
 
     index = PackageIndex.for_map(package_path)
-    texture_set = TextureSet(texture_package)
+    texture_set = TextureSet(texture_package, materials=with_materials)
     collect_brush_materials(p, index, texture_set)
 
     mesh_actors, mesh_stats, mesh_exec = [], None, []
@@ -292,6 +292,13 @@ def _build_assets(p, package_path, texture_package, out_dir, max_size, with_mesh
     written, uc_path = export_textures(
         texture_set, out_dir, index, max_size=max_size, extra_exec=mesh_exec
     )
+    if with_meshes:
+        from convert.meshes import apply_skins
+
+        # Last, because both halves have to be settled first: export_meshes is
+        # where a mesh's elements are read at all, and export_textures is where
+        # the materials over them are actually built.
+        apply_skins(mesh_actors + mover_actors, mesh_set, texture_set, mesh_stats)
     return (texture_set, written, uc_path, mesh_actors, mesh_stats,
             terrain_actors, terrain_stats, sky_info, sound_actors, sound_stats,
             mover_actors, mover_stats)
@@ -331,7 +338,7 @@ def cmd_t3d(args):
             no_collision=pad_meshes,
             no_skybox=args.no_skybox, with_sounds=not args.no_sounds,
             sound_gain=args.sound_gain, with_movers=not args.no_movers,
-            max_keys=args.mover_keys,
+            max_keys=args.mover_keys, with_materials=not args.no_materials,
         )
         print("  package: %s" % os.path.dirname(os.path.dirname(uc_path)))
         print("  textures: %d written, %d materials unresolved -> %s"
@@ -339,11 +346,41 @@ def cmd_t3d(args):
         if texture_set.composited:
             print("      %d had a separate UE3 opacity mask baked into their alpha"
                   % len(texture_set.composited))
+        if texture_set.blended:
+            print("      %d recoloured by a two-tone material's colour pair"
+                  % len(texture_set.blended))
+        if texture_set.tinted:
+            print("      %d drew their colour from one channel of a packed mask, "
+                  "tinted by the material's Base Color" % len(texture_set.tinted))
         if texture_set.refused:
             unique_refused = sorted(set(texture_set.refused))
             print("      %d material(s) resolved to something that is not a colour "
                   "map and use the placeholder instead: %s"
                   % (len(texture_set.refused), ", ".join(unique_refused[:3])))
+        if texture_set.materials:
+            blends = {}
+            tinted = panned = 0
+            for _name, blend, _unlit, colour, panner in texture_set.built:
+                blends[blend] = blends.get(blend, 0) + 1
+                tinted += 1 if colour else 0
+                panned += 1 if panner else 0
+            if blends:
+                extra = []
+                if tinted:
+                    extra.append("%d tinted by a folded colour" % tinted)
+                if panned:
+                    extra.append("%d panning" % panned)
+                print("      %d UT3 material(s) a flat texture cannot express (%s) "
+                      "-> %d generated object(s)%s"
+                      % (len(texture_set.built),
+                         ", ".join("%d %s" % (n, b.replace("BLEND_", "").lower())
+                                   for b, n in sorted(blends.items())),
+                         len(texture_set.materials),
+                         "; " + ", ".join(extra) if extra else ""))
+            if texture_set.invisible:
+                print("      %d material(s) UT3 itself draws at zero opacity "
+                      "(pure screen distortion), so nothing is built and the "
+                      "surfaces they dress are dropped" % len(texture_set.invisible))
         if texture_set.no_alpha_channel:
             print("      %d wanted a cutout but UT3 gave no mask to bake, so they "
                   "stay opaque: %s" % (len(texture_set.no_alpha_channel),
@@ -365,6 +402,18 @@ def cmd_t3d(args):
     inline_dome = None
     dome_clamped = False
     world_margin = args.world_margin + stats.max_brush_radius
+    if world_bounds and mesh_actors:
+        from convert.skybox_move import drop_distant_effects
+
+        mesh_actors, dropped_effects = drop_distant_effects(
+            mesh_actors, (tuple(world_bounds[0]), tuple(world_bounds[1])),
+            FAR_CLIPPING_PLANE)
+        if dropped_effects:
+            mesh_stats.drawn_effects -= dropped_effects
+            mesh_stats.actors -= dropped_effects
+            print("  %d effect actor(s) dropped: further from the play area than the "
+                  "%.0f far clipping plane, so nothing would draw them"
+                  % (dropped_effects, FAR_CLIPPING_PLANE))
     if sky_info and args.sky_mode == "inline" and world_bounds:
         from convert.skybox import fit_inline_dome
         from convert.skybox_move import parse_location, parse_scale
@@ -486,6 +535,22 @@ def cmd_t3d(args):
                                             ambient_gain=args.ambient_gain)
         for light in lights:
             t3d.add(light)
+
+    # An ambient given on the command line wins over anything derived. UT3
+    # states a level's fill light as a SkyLight and --ambient-gain scales that,
+    # but a UDK map lit by baked lightmaps has no SkyLight at all -- BL-Dekk
+    # has none, and 264 LightMapTexture2Ds instead -- so there is nothing for a
+    # gain to multiply and only a number given here can light the map.
+    if args.ambient is not None:
+        hue, saturation = 0, 255  # white: UE2 reads 255 saturation as unsaturated
+        if light_stats is not None and light_stats.ambient:
+            hue, saturation = light_stats.ambient[1], light_stats.ambient[2]
+        if light_stats is None:
+            from convert.lights import LightStats
+
+            light_stats = LightStats()
+        light_stats.ambient = (max(0, min(255, args.ambient)), hue, saturation)
+        light_stats.ambient_parts = [light_stats.ambient[0]]
     for actor in terrain_actors:
         t3d.add(actor)
     for actor in sound_actors:
@@ -780,6 +845,10 @@ def cmd_t3d(args):
         print("      ^ set by hand in View > Level Properties > ZoneLight")
     if light_stats:
         print("  %s" % light_stats)
+        if not light_stats.ambient and args.ambient is None:
+            print("      no SkyLight, so the zone gets no ambient at all -- if the "
+                  "map plays dark, --ambient N is the dial (a UDK map bakes its "
+                  "fill light into lightmaps, which do not convert)")
         if light_stats.ambient:
             b, h, sat = light_stats.ambient
             parts = getattr(light_stats, "ambient_parts", [])
@@ -790,9 +859,13 @@ def cmd_t3d(args):
             if floored is not None:
                 detail += (" (raised from %d: one dim SkyLight, and a map with "
                            "any SkyLight gets at least this much)" % floored)
-            print("  UT3 SkyLight -> AmbientBrightness=%d AmbientHue=%d "
-                  "AmbientSaturation=%d%s; --ambient-gain to taste"
-                  % (b, h, sat, detail))
+            if args.ambient is not None:
+                print("  --ambient -> AmbientBrightness=%d AmbientHue=%d "
+                      "AmbientSaturation=%d (given, not derived)" % (b, h, sat))
+            else:
+                print("  UT3 SkyLight -> AmbientBrightness=%d AmbientHue=%d "
+                      "AmbientSaturation=%d%s; --ambient-gain to taste"
+                      % (b, h, sat, detail))
     if actor_stats:
         print("  %s" % actor_stats)
     if onslaught_stats and (onslaught_stats.cores or onslaught_stats.vehicles):
@@ -960,6 +1033,10 @@ def build_parser():
     sp.add_argument("--keep-effect-meshes", action="store_true",
                     help="convert unlit translucent effect meshes (light beams, fog sheets) "
                          "instead of skipping them; they import as opaque surfaces")
+    sp.add_argument("--no-materials", action="store_true",
+                    help="do not build UE2 Shader/FinalBlend objects for translucent, "
+                         "additive or unlit surfaces; every surface falls back to a "
+                         "flat texture, which is what the converter did before")
     sp.add_argument("--surface-scale", type=float, default=1.0,
                     help="extra multiplier on BSP surface UVs; 1.0 reproduces UT3's "
                          "own tiling (the real conversion is UE3_BSP_UV_SCALE)")
@@ -1004,6 +1081,11 @@ def build_parser():
                     help="omit weapon bases, health, armour and powerups")
     sp.add_argument("--no-paths", action="store_true",
                     help="omit PathNodes and jump pads (bots then have no paths)")
+    sp.add_argument("--ambient", type=int, default=None,
+                    help="set the zone's AmbientBrightness (0-255) outright, "
+                         "overriding whatever the SkyLights give. A UDK map "
+                         "bakes its fill light into lightmaps and often has no "
+                         "SkyLight, leaving nothing for --ambient-gain to scale")
     sp.add_argument("--ambient-gain", type=float, default=16.0,
                     help="scales the UT3 SkyLight into a UT2004 AmbientBrightness (default 16)")
     sp.add_argument("--light-radius-scale", type=float, default=1.0,

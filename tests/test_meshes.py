@@ -143,10 +143,35 @@ def main(path):
     from convert.shaders import material_is_effect, mesh_is_effect
     # Unlit + non-opaque + no DiffuseColor = a procedural glow with no UE2
     # equivalent; anything with real surface colour must keep converting.
-    kept, _k = convert_actors(p, index, MeshSet("K"), TextureSet("K"), skip_effects=True)
-    allm, _a = convert_actors(p, index, MeshSet("A"), TextureSet("A"), skip_effects=False)
-    check("effect actors skipped by default", len(allm) - len(kept), 26)
+    # Phase 14: an effect mesh is kept when a UE2 material can be built for it,
+    # which is the whole point of being able to build one -- the objection was
+    # to drawing a glow as an opaque quad, not to the texture. With materials
+    # off (--no-materials) the old behaviour has to come back exactly.
+    flat = TextureSet("K", materials=False)
+    kept, _k = convert_actors(p, index, MeshSet("K"), flat, skip_effects=True)
+    allm, _a = convert_actors(p, index, MeshSet("A"), TextureSet("A", materials=False),
+                              skip_effects=False)
+    check("effect actors skipped when no material can be built", len(allm) - len(kept), 26)
     check_that("--keep-effect-meshes converts them", len(allm) > len(kept))
+    rich = TextureSet("M")
+    drawn, drawn_stats = convert_actors(p, index, MeshSet("M"), rich, skip_effects=True)
+    check_that("with materials on they are drawn instead of skipped",
+               len(drawn) > len(kept))
+    check("and every one that came back has a material to wear",
+          len(drawn) - len(kept), drawn_stats.drawn_effects)
+    # Nothing is built until the textures are settled -- see
+    # TextureSet.build_materials -- so at this point they are still pending.
+    check_that("which needed non-opaque materials held for building",
+               len(rich.pending) > 0, "%d pending" % len(rich.pending))
+    for texture_name in list(rich.textures):
+        rich.alpha_channel[texture_name] = False
+    rich.build_materials(index)
+    check_that("and those become real UE2 objects", len(rich.materials) > 0,
+               "%d objects" % len(rich.materials))
+    check_that("none of which is over the placeholder",
+               all(rich.FALLBACK_NAME not in value
+                   for _kind, props in rich.materials.definitions.values()
+                   for _key, value in props))
     # Some effects the material test cannot reach at all:
     # S_UN_Volumetrics_FogVolume_Mesh_01 has an element whose material does not
     # resolve, so there is no BlendMode to judge and a light shaft converts as a

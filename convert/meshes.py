@@ -13,9 +13,10 @@ import struct
 from ut2.ase import write_ase
 from ut2.t3d import Actor, rot, vec
 from convert.rotation import axis_images, multiply, rotate, rotation_matrix, to_rotator
-from convert.shaders import (effect_substitute, mesh_is_effect, sheet_is_horizontal,
-                             water_substitute)
+from convert.shaders import (effect_is_drawable, effect_substitute, mesh_is_effect,
+                             sheet_is_horizontal, water_substitute)
 from ut3.objects.level import ordered_exports
+from convert.textures import _material_key
 from ut3.objects.material import material_uv_channel
 from ut3.objects.staticmesh import read_static_mesh, validate
 from ut3.props import read_object_properties
@@ -48,6 +49,7 @@ class MeshStats:
         self.actor_mesh_names = []
         self.mesh_triangle_counts = {}
         self.skipped_effects = 0
+        self.drawn_effects = 0      # effect meshes kept because a material converts
         self.jump_pad_meshes = 0
         self.substituted_effects = 0
         self.substituted_water = 0
@@ -56,6 +58,7 @@ class MeshStats:
         self.non_blocking = 0
         self.skipped_hidden = 0
         self.uv_channels = {}       # mesh -> the UV set its material asks for
+        self.skinned = 0            # actors given a generated UE2 material
 
     def __str__(self):
         out = ("%d static meshes (%d triangles), %d actors placing %d triangles"
@@ -66,6 +69,11 @@ class MeshStats:
             out += "; %d never drawn in UT3 either" % self.skipped_hidden
         if self.skipped_effects:
             out += "; %d effect actors skipped" % self.skipped_effects
+        if self.drawn_effects:
+            out += ("; %d effect actors drawn with a generated UE2 material"
+                    % self.drawn_effects)
+        if self.skinned:
+            out += "; %d actor(s) wearing one through Skins" % self.skinned
         if self.jump_pad_meshes:
             out += ("; %d jump pads given the marker UT2004's own draws nothing for"
                     % self.jump_pad_meshes)
@@ -102,12 +110,25 @@ class MeshSet:
     def __init__(self, package_name):
         self.package_name = package_name
         self.by_ref = {}     # (is_import, index, materials) -> mesh name
-        self.meshes = {}     # mesh name -> (Package, export, material overrides)
+        # mesh name -> (Package, export, material overrides, override package).
+        # The overrides come from the actor's component and so belong to the
+        # *map*, while the mesh belongs to whatever content package defines it.
+        # In a cooked UT3 map those are the same file and the distinction never
+        # shows; a UDK map keeps its meshes in separate .upk files, and
+        # resolving a map's override index against a content package reads some
+        # unrelated object or runs off the import table entirely.
+        self.meshes = {}
+        # mesh name -> [UE2 material path per element, None where the element
+        # needs none]. Filled by export_meshes, which is the only place the
+        # elements are read; `apply_skins` then puts them on the actors.
+        self.skins = {}
 
     def name_for(self, ref, overrides=()):
         if ref is None or ref.is_null:
             return None
-        name = self.by_ref.get((ref.is_import, ref.index, overrides))
+        name = self.by_ref.get(
+            (ref.pkg.path, ref.is_import, ref.index,
+             tuple(None if r is None else str(r) for r in overrides)))
         if not name:
             return None
         return "%s.%s" % (self.package_name, name)
@@ -124,7 +145,9 @@ class MeshSet:
     def add(self, pkg, index, ref, overrides=()):
         # Key on the material *paths*: object references are distinct instances
         # per actor, so keying on them would split every actor into its own mesh.
-        key = (ref.is_import, ref.index,
+        # The package is part of the key for the same reason it is in
+        # TextureSet: an index means nothing without the table it came from.
+        key = (ref.pkg.path, ref.is_import, ref.index,
                tuple(None if r is None else str(r) for r in overrides))
         if key in self.by_ref:
             return self.by_ref[key]
@@ -133,14 +156,14 @@ class MeshSet:
             self.by_ref[key] = None
             return None
         signature = key[2]
-        for name, (existing_pkg, existing, existing_over) in self.meshes.items():
+        for name, (existing_pkg, existing, existing_over, _over_pkg) in self.meshes.items():
             if (existing_pkg is owner and existing.index == export.index
                     and tuple(None if r is None else str(r)
                               for r in existing_over) == signature):
                 self.by_ref[key] = name
                 return name
         name = self._unique(export.name)
-        self.meshes[name] = (owner, export, overrides)
+        self.meshes[name] = (owner, export, overrides, pkg)
         self.by_ref[key] = name
         return name
 
@@ -330,7 +353,8 @@ def convert_actors(pkg, index, mesh_set, texture_set=None, scale=1.0, stats=None
         # Unless UT2004 already ships a material that says the same thing, in
         # which case the actor is kept and wears that instead.
         substitute = None
-        if skip_effects and mesh_is_effect(pkg, index, mesh_ref, effect_cache):
+        is_effect = bool(skip_effects) and mesh_is_effect(pkg, index, mesh_ref, effect_cache)
+        if is_effect:
             rotation = props.get("Rotation")
             substitute = effect_substitute(pkg, index, mesh_ref,
                                            _material_overrides(pkg, comp), effect_cache)
@@ -340,9 +364,20 @@ def convert_actors(pkg, index, mesh_set, texture_set=None, scale=1.0, stats=None
                     else (0, 0, 0), effect_cache):
                 substitute = None
             if substitute is None:
-                stats.skipped_effects += 1
-                continue
-            stats.substituted_effects += 1
+                # A stock UT2004 material was the only way to draw one of these
+                # until the converter could build its own. Now it can, so the
+                # mesh is kept whenever UT3's own material converts -- see
+                # effect_is_drawable for why the objection at the top of
+                # shaders.py was to the blend mode rather than to the texture.
+                if effect_is_drawable(pkg, index, mesh_ref,
+                                      _material_overrides(pkg, comp), texture_set,
+                                      effect_cache):
+                    stats.drawn_effects += 1
+                else:
+                    stats.skipped_effects += 1
+                    continue
+            else:
+                stats.substituted_effects += 1
         elif texture_set is not None:
             # Not an effect, but water is procedural in UT3 too -- tint,
             # refraction and fresnel are all shader parameters, and the only
@@ -404,6 +439,9 @@ def convert_actors(pkg, index, mesh_set, texture_set=None, scale=1.0, stats=None
         # Remember what it was in UT3: only plain scenery may be relocated into
         # the skybox, never a mover staged off-map.
         emitted.source_class = source_class
+        # And whether it is one of UT3's volumetric effects, which are drawn on
+        # sufferance: see drop_distant_effects.
+        emitted.is_effect = is_effect
         out.append(emitted)
         stats.actor_mesh_names.append(mesh_name)
         stats.actors += 1
@@ -421,7 +459,7 @@ def export_meshes(mesh_set, out_dir, index, texture_set=None, scale=1.0,
     lines = []
     counts = {}
     for name in sorted(mesh_set.meshes):
-        owner, export, overrides = mesh_set.meshes[name]
+        owner, export, overrides, override_pkg = mesh_set.meshes[name]
         mesh = read_static_mesh(owner, export)
         if mesh is None:
             stats.skipped_unreadable += 1
@@ -436,6 +474,7 @@ def export_meshes(mesh_set, out_dir, index, texture_set=None, scale=1.0,
 
         # Element -> material index, and the texture each one resolves to.
         textures = []
+        skins = []
         face_material = {}
         for material_index, element in enumerate(lod.elements):
             texture_name = None
@@ -443,11 +482,26 @@ def export_meshes(mesh_set, out_dir, index, texture_set=None, scale=1.0,
             # differently per actor, and the mesh's own material is often a
             # placeholder that resolves to something meaningless like a cubemap.
             material = element.material
+            material_pkg = owner
             if material_index < len(overrides) and overrides[material_index] is not None:
                 material = overrides[material_index]
+                material_pkg = override_pkg
             if texture_set is not None:
-                resolved = texture_set.add_material(owner, index, material)
+                resolved = texture_set.add_material(material_pkg, index, material)
                 texture_name = resolved
+                # A UE2 material cannot go in the ASE: `*BITMAP` is resolved at
+                # `#exec` time, during class parsing, and the materials do not
+                # exist until defaultproperties are imported at the end of the
+                # build. So the mesh keeps its flat texture and the actor
+                # overrides it through Skins, which UT2004 reads per material
+                # index (AActor::GetSkin, Engine/Src/UnActor.cpp:1275).
+                #
+                # The reference is kept rather than resolved: the materials are
+                # not built until the textures have been written, which is
+                # after this runs. apply_skins settles it.
+                pending = (material is not None and not material.is_null
+                           and _material_key(material) in texture_set.pending)
+                skins.append(material if pending else None)
             textures.append(texture_name or texture_set.FALLBACK_NAME if texture_set else None)
             for t in range(element.num_triangles):
                 face_material[element.first_index // 3 + t] = material_index
@@ -481,6 +535,8 @@ def export_meshes(mesh_set, out_dir, index, texture_set=None, scale=1.0,
                         uvs[v] = (u * u_tiling, w * v_tiling)
                 if channel:
                     stats.uv_channels[name] = channel
+        if any(skins):
+            mesh_set.skins[name] = skins
         path = write_ase(os.path.join(meshes_dir, "%s.ase" % name), name,
                          lod.positions, uvs, faces, textures, scale=scale)
         # NOT "#exec STATICMESH IMPORT": that handler only accepts LightWave
@@ -496,3 +552,48 @@ def export_meshes(mesh_set, out_dir, index, texture_set=None, scale=1.0,
     stats.mesh_triangle_counts = counts
     stats.scene_triangles = sum(counts.get(n, 0) for n in stats.actor_mesh_names)
     return lines, stats
+
+
+def apply_skins(actors, mesh_set, texture_set, stats=None):
+    """Put each mesh's UE2 materials on the actors that place it.
+
+    UT2004 keeps materials on the static mesh, and the ASE is the only way to
+    put them there -- but an ASE binds `*BITMAP` while the package is being
+    parsed, long before a `Begin Object` material exists (see export_meshes).
+    `Skins(n)` is the way round it: it overrides material index n per actor
+    (AActor::GetSkin, Engine/Src/UnActor.cpp:1275), and it is what
+    convert/shaders.py already uses for the goo and the teleporter portals.
+
+    Per actor rather than per mesh is not the waste it looks: a mesh is keyed
+    by its material set, so every actor placing one wants exactly the same
+    Skins, and the t3d is text UnrealEd reads once.
+
+    An actor that already carries a Skins(0) keeps it. That is the stock-material
+    substitution -- UT3's goo wearing XEffectMat's -- which was chosen against
+    the actor rather than derived from the mesh, and is the more specific answer.
+    """
+    applied = 0
+    for actor in actors:
+        mesh = None
+        for key, value in actor.properties:
+            if key == "StaticMesh":
+                mesh = value.split(".")[-1].rstrip("'")
+            elif key.startswith("Skins("):
+                mesh = None
+                break
+        refs = mesh_set.skins.get(mesh) if mesh else None
+        if not refs:
+            continue
+        wearing = False
+        for i, ref in enumerate(refs):
+            if ref is None:
+                continue
+            path = texture_set.material_class_for(ref)
+            # None where the material was pending but its texture was dropped.
+            if path and not path.startswith("Texture'"):
+                actor.properties.append(("Skins(%d)" % i, path))
+                wearing = True
+        applied += 1 if wearing else 0
+    if stats is not None:
+        stats.skinned = applied
+    return applied

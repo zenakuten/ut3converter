@@ -585,7 +585,13 @@ def convert_brushes(pkg, texture_package=None, scale=1.0, include_volumes=False,
                     texture_u=tuple(c * su / scale for c in poly.texture_u),
                     texture_v=tuple(c * sv / scale for c in poly.texture_v),
                     vertices=verts,
-                    texture=(texture_set.name_for(poly.material) if texture_set
+                    # material_for, not name_for: a translucent or additive
+                    # BSP surface gets the FinalBlend built for it, and
+                    # everything else falls through to its plain texture. The
+                    # t3d polygon importer names no class, so the bare path is
+                    # what goes here -- it searches ANY_PACKAGE by name
+                    # (Editor/Src/UnEdFact.cpp:1602).
+                    texture=(texture_set.material_for(poly.material) if texture_set
                              else material_texture_name(pkg, poly.material, texture_package)),
                     flags=flags,
                     link=poly.link,

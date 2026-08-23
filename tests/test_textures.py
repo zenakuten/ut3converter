@@ -180,7 +180,15 @@ def main(path):
             for poly in brush.polygons:
                 if poly.texture:
                     refs.add(poly.texture.rsplit(".", 1)[1])
-        check("no t3d reference lacks a texture file", sorted(refs - on_disk), [])
+        # A surface may now name a generated material object rather than a
+        # texture -- an unlit or glowing one gets a Shader, a translucent one a
+        # FinalBlend -- so both are legitimate targets. What must never happen
+        # is a reference to neither.
+        built = set(texture_set.materials.definitions) if texture_set.materials else set()
+        check("no t3d reference lacks a texture file or a material",
+              sorted(refs - on_disk - built), [])
+        check_that("and some surfaces do name a generated material",
+                   bool(refs & built), "%d of %d" % (len(refs & built), len(refs)))
         # UnrealEd flags a poly with no material as a null material reference on
         # every build, so every polygon must carry a texture.
         untextured = [q for b in brushes for q in b.polygons if not q.texture]
@@ -485,6 +493,222 @@ def main(path):
         check("and carries just the one", len(blob), 128 + 8)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+    print("folding a UE3 material graph to a constant")
+    from ut3.objects import graph as G
+    from ut3.objects.material import constant_colour, material_panner
+
+    # sRGB, not linear: UE3 authors colour parameters linearly and gamma-
+    # corrects on output, UE2 stores what it displays. 0.5 linear is 188, not
+    # 128, and getting this wrong makes every tint muddy.
+    check("mid grey converts through sRGB", G.to_color((0.5, 0.5, 0.5, 1.0))[:3],
+          (188, 188, 188))
+    check("black and white are fixed points",
+          (G.to_color((0.0,) * 4)[:3], G.to_color((1.0,) * 4)[:3]),
+          ((0, 0, 0), (255, 255, 255)))
+    check("alpha is passed in, not taken from the colour input",
+          G.to_color((1.0, 1.0, 1.0, 0.0), 1.0)[3], 255)
+
+    # M_EV_FogSheet_Master_01 states its EmissiveColor as Color.rgb * Color.a
+    # and nothing else, so an instance overriding Color is the entire
+    # appearance of a fog sheet. This is the case the whole folder exists for.
+    sheet = p.find("M_EV_FogSheet_Master_01_INST")
+    check_that("a fog sheet instance folds to its own colour",
+               sheet and constant_colour(p, index, p.ref(sheet[0].index))
+               == (144, 173, 189),
+               str(constant_colour(p, index, p.ref(sheet[0].index)) if sheet else None))
+    master = p.find("M_EV_FogSheet_Master_01")
+    check("the master it inherits from folds to its own default",
+          constant_colour(p, index, p.ref(master[0].index)), (255, 255, 255))
+
+    # An opacity chain must NOT fold: UT3 drives it from PixelDepth through a
+    # DotProduct and a Divide, which is a per-pixel depth fade with no UE2
+    # counterpart. Folding it anyway produced 0.0002.
+    from ut3.objects.material import _expression_ref, base_material
+    owner, _base, mprops = base_material(p, index, p.ref(master[0].index))
+    opacity = _expression_ref(mprops.get("Opacity"))
+    check("an opacity chain declines rather than guessing",
+          G.fold(owner, index, opacity,
+                 G.collect_parameters(p, index, p.ref(master[0].index))), None)
+
+    # An opacity chain does not fold, but the *level* it is scaled to usually
+    # is -- one scalar parameter multiplied in at the top. That scalar is the
+    # difference between a light beam and a searchlight: DM-Deck's beams run
+    # from 0.035 to 0.25, and drawing them all at full strength is what made
+    # StaticMeshActor_4611 look wrong.
+    from ut3.objects.material import opacity_scale
+
+    # This one puts its Opacity scalar one level down inside the product, under
+    # a DepthBiasedAlpha. Stopping at the first Multiply whose sides both fail
+    # to fold missed it and drew the beam ten times too strong.
+    beam = p.find("M_EV_Lightbeam_Master_01_INST")
+    check("a scalar nested inside the product is still found",
+          beam and round(opacity_scale(p, index, p.ref(beam[0].index)), 3), 0.1)
+    sheet_inst = p.find("M_EV_FogSheet_Master_01_INST")
+    check("a material that scales nothing reads 1.0",
+          sheet_inst and opacity_scale(p, index, p.ref(sheet_inst[0].index)), 1.0)
+    # A Clamp is transparent on the spine but not inside the product: this
+    # map's beams clamp `PixelDepth * 0.0025` deep in theirs, and taking that
+    # 0.0025 as a level gives 0.000125 and an invisible beam.
+    beam1 = p.find("LightBeam1Sided")
+    check("a clamp inside the product is not mistaken for a level",
+          beam1 and round(opacity_scale(p, index, p.ref(beam1[0].index)), 3), 0.25)
+
+    # And one taken from under a chain of texture samples this map's
+    # window glass multiplies together.
+    glass = p.find("M_LT_Base_BSP_Glass_01")
+    check("a scalar multiplied into an opacity chain is taken",
+          glass and round(opacity_scale(p, index, p.ref(glass[0].index)), 3), 0.4)
+    # Zero means UT3 draws nothing: M_EFX_Particles_Distortion01 is pure
+    # screen distortion, states Opacity = Constant 0, and must not become an
+    # opaque quad.
+    distort = p.find("M_EFX_Particles_Distortion01")
+    check("a material UT3 draws at zero opacity reads zero",
+          distort and opacity_scale(p, index, p.ref(distort[0].index)), 0.0)
+    refused = TextureSet("Pkg")
+    refused.add_material(p, index, p.ref(distort[0].index))
+    check("and is not built at all", len(refused.pending), 0)
+    check_that("but is reported", len(refused.invisible) == 1)
+
+    # A Panner on the coordinates is one of the few nodes with an exact UE2
+    # counterpart. UE2 states it as a rotator plus a rate, and the rate is the
+    # magnitude of UE3's (SpeedX, SpeedY).
+    panner = material_panner(p, index, p.ref(master[0].index))
+    check_that("a panner converts to a direction and a rate",
+               panner is not None and abs(panner[1] - 0.0335) < 0.001, str(panner))
+    # And the direction is the angle, *unnegated*. The ASE writes `1.0 - v` and
+    # the importer computes `1.0 - ST.Y` back (UnStaticMesh.cpp:1048), so the
+    # flips cancel and a converted mesh carries UT3's own UVs; the BSP writer
+    # never flips at all. Negating SpeedY for a flip that does not survive to
+    # the data reversed every panning material along V.
+    import math
+    speeds = {"M_EV_FogSheet_Master_01": (0.03, -0.015),
+              "M_EV_Lightbeam_Master_01": (0.01, 0.04)}
+    for name, (sx, sy) in speeds.items():
+        found = p.find(name)
+        if not found:
+            continue
+        got = material_panner(p, index, p.ref(found[0].index))
+        want = int(round(math.atan2(sy, sx) / (2 * math.pi) * 65536)) & 0xFFFF
+        check("%s pans the way UT3 states it" % name, got and got[0], want)
+    # A panner along U alone is the control: it has no V component to get
+    # backwards, so it must be yaw 0 under either reading.
+    check("a pure-U panner is yaw 0",
+          int(round(math.atan2(0.0, 0.75) / (2 * math.pi) * 65536)) & 0xFFFF, 0)
+
+    # A Panner animates the sample it is wired to and no other. Where the drawn
+    # sample is known, its Coordinates are the authority *including when they
+    # say no* -- HeatRay's city sign has a scrolling LED underlay and static
+    # artwork over it, and reading the material at large put the underlay's
+    # Panner on the artwork and set the whole sign sliding.
+    sign = p.find("M_HU_Deco_SM_CitySignStores")
+    check("a sample with no Panner of its own does not pan",
+          sign and material_panner(p, index, p.ref(sign[0].index)), None)
+    # But where the texture came from the last-resort scan there is no sample
+    # to ask, and the material's own Panner is the only information there is.
+    # The fog sheets and light beams live here: no texture in the colour path.
+    sheet = p.find("M_EV_FogSheet_Master_01_INST")
+    check_that("a material with no drawn sample still uses its own Panner",
+               sheet and material_panner(p, index, p.ref(sheet[0].index)) is not None)
+
+    print("generated UE2 materials (Phase 14)")
+    from convert.shaders import FRAME_BUFFER_BLENDING
+    from ut2.materials import MaterialSet
+
+    # Read out of D3D9MaterialState.cpp:299 rather than chosen: FB_Brighten is
+    # SRCALPHA/ONE, FB_AlphaBlend is SRCALPHA/INVSRCALPHA, FB_Translucent is
+    # ONE/INVSRCCOLOR -- keyed on brightness, not alpha.
+    check("additive maps to FB_Brighten",
+          FRAME_BUFFER_BLENDING["BLEND_Additive"], "FB_Brighten")
+    check("translucent maps to FB_AlphaBlend, alpha permitting",
+          FRAME_BUFFER_BLENDING["BLEND_Translucent"], "FB_AlphaBlend")
+    check("modulate maps to FB_Modulate",
+          FRAME_BUFFER_BLENDING["BLEND_Modulate"], "FB_Modulate")
+    check("masked builds nothing on its own",
+          FRAME_BUFFER_BLENDING.get("BLEND_Masked"), None)
+
+    # The real thing, end to end, against the map: HeatRay's light beams and
+    # fog sheets are the materials a flat texture cannot express.
+    live = TextureSet("HeatRayTex")
+    for name in ("M_EV_FogSheet_Master_01_INST", "M_EV_Lightbeam_Master_01_INST"):
+        found = p.find(name)
+        if found:
+            live.add_material(p, index, p.ref(found[0].index))
+    check_that("non-opaque materials are held for later", len(live.pending) > 0)
+    check("and nothing is built until the textures are settled",
+          len(live.materials), 0)
+    # build_materials wants exported textures; fake the two facts it reads.
+    for texture_name in list(live.textures):
+        live.alpha_channel[texture_name] = False
+    live.build_materials(index)
+    check_that("then real objects appear", len(live.materials) > 0,
+               "%d objects" % len(live.materials))
+    kinds = set(kind for kind, _props in live.materials.definitions.values())
+    check_that("a Shader for the unlit part", "Shader" in kinds, str(sorted(kinds)))
+    check_that("a FinalBlend on the outside", "FinalBlend" in kinds)
+    check_that("a TexPanner, since both materials scroll", "TexPanner" in kinds)
+    blends = [dict(props).get("FrameBufferBlending")
+              for kind, props in live.materials.definitions.values()
+              if kind == "FinalBlend"]
+    # No alpha channel above, so BLEND_Translucent has to fall back to UE2's
+    # brightness-keyed blend rather than draw solid.
+    check("with no alpha to blend on, translucent falls back to FB_Translucent",
+          set(blends), {"FB_Translucent"})
+
+    ms = MaterialSet("Pkg", "abcd")
+    a = ms.add("Shader", "Beam_abcd", [("Diffuse", "Texture'Pkg.BSP.Beam_abcd'")])
+    check("the tag is not doubled onto a name that already carries it",
+          a, "Beam_abcdSH")
+    b = ms.add("FinalBlend", "Beam_abcd", [("Material", ms.path(a))])
+    before = len(ms)
+    check("an identical definition is shared, not duplicated",
+          ms.add("Shader", "Beam_abcd", [("Diffuse", "Texture'Pkg.BSP.Beam_abcd'")]), a)
+    check("so the set does not grow", len(ms), before)
+
+    text = "\n".join(ms.emit())
+    check_that("every object is declared", text.count("Begin Object") == len(ms))
+    # SavePackage writes only what something references: without KeepAlive the
+    # whole lot is built and silently dropped.
+    check("and every one is kept alive", text.count("GeneratedMaterials("), len(ms))
+    check_that("a dependency is written before what refers to it",
+               text.index("Name=%s" % a) < text.index("Name=%s" % b))
+
+    # A normal map drawn as diffuse renders in iridescent blue and magenta
+    # (Phase 7c). The name rules catch most; the pixels catch the rest, a
+    # tangent-space normal being a unit vector packed around (128, 128, 255).
+    def measured(means):
+        probe = TextureSet("Pkg")
+        probe._measure_means = lambda o, e: means
+        return probe._is_normal_map(None, type("E", (), {"index": 1})())
+    check("a flat tangent normal is refused", measured([128, 128, 255]), True)
+    check("BL-Dekk's SF_T_TilingBubbles_N_H is refused", measured([128, 126, 254]), True)
+    check("blue sky is not a normal map", measured([90, 140, 220]), False)
+    check("grey stone is not a normal map", measured([120, 118, 115]), False)
+    check("a bright cyan diffuse is not a normal map", measured([60, 200, 230]), False)
+
+    # A two-tone material blends two colours per pixel by one channel of its
+    # own map, which no tint can express -- the pipes are a red body with pale
+    # trim, and multiplying the whole texture by red loses the trim.
+    from ut2.dxt import encode_dxt1_rgb, decode_dxt1_channel
+
+    block = [(255, 0, 0)] * 8 + [(255, 255, 255)] * 8
+    encoded = encode_dxt1_rgb(block, 4, 4)
+    check("a DXT1 block is eight bytes", len(encoded), 8)
+    got = [tuple(decode_dxt1_channel(encoded, 4, 4, c)[i] for c in range(3))
+           for i in (0, 15)]
+    check("and keeps both colours of a two-tone block", got, [(255, 0, 0), (255, 255, 255)])
+
+    print("materials follow their texture")
+    check_that("a set with materials on has a MaterialSet",
+               TextureSet("Pkg").materials is not None)
+    check_that("--no-materials gives none",
+               TextureSet("Pkg", materials=False).materials is None)
+    # A material over a texture that failed to export would name an object the
+    # package never imports, so build_materials has to skip it.
+    orphan = TextureSet("Pkg")
+    orphan.pending[("pkg", False, 7)] = (p, None, "GoneAway_%s" % orphan.tag, None)
+    orphan.build_materials(index)
+    check("a dropped texture builds no material", len(orphan.materials), 0)
 
     print()
     if _failures:

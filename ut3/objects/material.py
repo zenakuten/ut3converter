@@ -6,6 +6,8 @@ fails, it falls back to the material's own texture expressions, preferring names
 that do not look like normal/specular maps.
 """
 
+import re
+
 from ..props import Struct, read_object_properties
 
 DIFFUSE_INPUTS = ("DiffuseColor", "DiffusePower", "EmissiveColor", "BaseColor")
@@ -67,6 +69,83 @@ def score_texture_name(name):
     return score
 
 
+_DECLARED_CHANNEL = re.compile(r"([rgba])\s*=\s*diffuse", re.I)
+_CHANNEL_INDEX = {"r": 0, "g": 1, "b": 2, "a": 3}
+_BASE_COLOR = re.compile(r"base\s*colou?r", re.I)
+
+# Set by resolve_diffuse when the texture it returned was chosen because a
+# parameter name declared which channel holds the albedo. Read it through
+# material_albedo, which clears it first, the way material_uv_channel reads
+# _LAST_SAMPLE.
+_LAST_ALBEDO = [None]
+
+
+def declared_diffuse_channel(name):
+    """The channel a parameter name declares as diffuse, or None.
+
+    TOXIKK's materials carry no diffuse map at all. They pack albedo, specular
+    and gloss into the channels of one texture and say so in the parameter
+    name -- "Mask 1 (R=Diffuse, G= Specular, B=Gloss)" -- then tint the result
+    with a Base Color vector parameter. A name stating its own channel layout
+    is far better evidence than any heuristic, and the scoring table would
+    otherwise throw that texture away: "mask", "spec" and "gloss" all count
+    against the one texture in the material that actually holds the colour,
+    and the search then falls through to the parent and lands on an unrelated
+    default.
+    """
+    found = _DECLARED_CHANNEL.search(name or "")
+    if found is None:
+        return None
+    return _CHANNEL_INDEX.get(found.group(1).lower())
+
+
+def resolve_base_color(pkg, index, ref, depth=12):
+    """The Base Color an instance tints its albedo with, as (r, g, b), or None.
+
+    Walked from the instance outwards, so a leaf that restates the colour wins
+    over the parent it inherits the texture from -- which is the usual shape:
+    MF_M_Wall_01_Dark_INST carries only a darker Base Color and takes its mask
+    from MF_M_Wall_01_INST one level up.
+    """
+    if depth <= 0:
+        return None
+    owner, export = index.resolve(pkg, ref)
+    if export is None:
+        return None
+    if owner.class_name_of(export) not in ("MaterialInstanceConstant",
+                                           "MaterialInstanceTimeVarying"):
+        return None
+    props, start, _end = read_object_properties(owner, export)
+    if start is None:
+        return None
+    params = props.get("VectorParameterValues")
+    if params is not None and len(params):
+        for entry in params.as_props():
+            if _BASE_COLOR.search(str(entry.get("ParameterName", ""))) is None:
+                continue
+            value = entry.get("ParameterValue")
+            if isinstance(value, Struct) and value.value is not None:
+                return tuple(value.value[:3])
+    parent = props.get("Parent")
+    if parent is not None and not parent.is_null:
+        return resolve_base_color(owner, index, parent, depth - 1)
+    return None
+
+
+def material_albedo(pkg, index, ref, depth=12, reject=None):
+    """(owner, texture, channel, tint) for what a material is painted with.
+
+    `channel` is None for an ordinary diffuse map, and a channel index when the
+    material declares its albedo as one channel of a packed mask; `tint` is the
+    Base Color to multiply that channel by, or None.
+    """
+    _LAST_ALBEDO[0] = None
+    owner, tex = resolve_diffuse(pkg, index, ref, depth, reject)
+    if tex is None:
+        return None, None, None, None
+    return owner, tex, _LAST_ALBEDO[0], resolve_base_color(pkg, index, ref, depth)
+
+
 def _expression_ref(value):
     """Pull the Expression object out of a material input struct."""
     if isinstance(value, Struct) and value.value is not None and hasattr(value.value, "get"):
@@ -125,8 +204,35 @@ def sample_coordinates(pkg, index, sample_export):
     return channel, _tiling("UTiling"), _tiling("VTiling")
 
 
-def _collect(pkg, index, export, depth, seen, found):
-    """Every texture sample reachable from `export`, in graph order."""
+def live_branch(pkg, index, export, props, params):
+    """For a StaticSwitchParameter, the input UE3 actually compiles: "A" or "B".
+
+    A static switch is not a runtime branch. UE3 compiles one side into the
+    shader and discards the other, so a texture on the dead side is never
+    sampled -- and following it anyway is how `M_EV_Lightbeam_Master_01` came
+    to be painted with `T_EV_DustPanner_01`, which `convert/shaders.py` has
+    described as "a disabled UseTextureOverlay branch" since Phase 1.
+
+    DM-Deck's goo sheets are the case that finally forced it. Their material is
+    called `M_UN_Volumetrics_TexturedFogSheet_01_Goo`, but it overrides no
+    static parameters at all and the master defaults UseTextureOverlay off --
+    so the cloud overlay it is named after is not drawn. UT3 draws a plain
+    falloff, tinted green. We drew the cloud.
+    """
+    name = str(props.get("ParameterName", ""))
+    on = params.switches.get(name) if params is not None else None
+    if on is None:
+        on = props.get("DefaultValue") is True
+    return "A" if on else "B"
+
+
+def _collect(pkg, index, export, depth, seen, found, params=None):
+    """Every texture sample reachable from `export`, in graph order.
+
+    Reachable means through the branches this material actually compiles: see
+    live_branch. Without `params` only the switches' own defaults are known,
+    which is still better than following both sides.
+    """
     if depth <= 0 or export.index in seen:
         return
     seen.add(export.index)
@@ -137,7 +243,10 @@ def _collect(pkg, index, export, depth, seen, found):
     props, start, _end = read_object_properties(pkg, export)
     if start is None:
         return
-    for key in FOLLOW_INPUTS:
+    keys = FOLLOW_INPUTS
+    if pkg.class_name_of(export) == "MaterialExpressionStaticSwitchParameter":
+        keys = (live_branch(pkg, index, export, props, params),)
+    for key in keys:
         for value in props.get_all(key):
             ref = _expression_ref(value)
             if ref is None and hasattr(value, "is_null"):
@@ -147,7 +256,7 @@ def _collect(pkg, index, export, depth, seen, found):
             sub_owner, sub_export = index.resolve(pkg, ref)
             if sub_export is None:
                 continue
-            _collect(sub_owner, index, sub_export, depth - 1, seen, found)
+            _collect(sub_owner, index, sub_export, depth - 1, seen, found, params)
 
 
 def _stem(name):
@@ -191,7 +300,8 @@ def names_the_texture(material_name, texture_name):
     return material.startswith(texture) and material[len(texture)] == "_"
 
 
-def _walk(pkg, index, export, depth, seen, reject=None, material_name=None):
+def _walk(pkg, index, export, depth, seen, reject=None, material_name=None,
+          params=None):
     """The most diffuse-looking texture reachable from `export`.
 
     Returns (owner, texture, sample_expression) so the caller can also ask the
@@ -206,7 +316,7 @@ def _walk(pkg, index, export, depth, seen, reject=None, material_name=None):
     is collected instead and the best-named one wins.
     """
     found = []
-    _collect(pkg, index, export, depth, seen, found)
+    _collect(pkg, index, export, depth, seen, found, params)
     if not found:
         return None, None, None
     # What the material is named after wins outright, but only among the
@@ -231,16 +341,112 @@ def _walk(pkg, index, export, depth, seen, reject=None, material_name=None):
     return tied[0]
 
 
-def _subobject_textures(pkg, index, material_export):
-    """Every texture sampled by expressions owned by this material."""
-    out = []
+def _subobject_textures(pkg, index, material_export, params=None):
+    """Every texture this material samples, preferring the ones it really draws.
+
+    The unfiltered list is every texture expression the material owns, reachable
+    or not, which is the last resort when the graph walk found nothing. That is
+    exactly where a dead static-switch branch does its damage: DM-Deck's goo
+    sheets own a cloud overlay they never sample, and it wins the name contest
+    against the falloff they do sample -- `score_texture_name` penalises
+    "falloff" by 60 as a rule aimed at cubemap falloffs.
+
+    So the reachable set is computed first and used when it is not empty.
+    Falling back to the whole list when nothing is reachable keeps a material
+    whose inputs this reader cannot follow from losing its texture entirely.
+    """
+    owned = []
     for e in pkg.exports:
         if e.outer != material_export.index:
             continue
         owner, tex = _texture_of(pkg, index, e)
         if tex is not None:
-            out.append((owner, tex))
-    return out
+            owned.append((owner, tex))
+    if not owned:
+        return owned
+    live = _reachable_textures(pkg, index, material_export, params)
+    if live:
+        narrowed = [entry for entry in owned
+                    if (entry[0].path, entry[1].index) in live]
+        if narrowed:
+            return narrowed
+    return owned
+
+
+# Every input a material can draw something through. Wider than DIFFUSE_INPUTS:
+# reachability is being asked, not "where is the colour", and a fog sheet's
+# only texture is in its Opacity.
+_MATERIAL_INPUTS = ("DiffuseColor", "DiffusePower", "EmissiveColor", "BaseColor",
+                    "Opacity", "OpacityMask", "SpecularColor")
+
+
+def _reachable_textures(pkg, index, material_export, params=None):
+    """{(package path, export index)} for the textures this material samples."""
+    return _reachable(pkg, index, material_export, params)[0]
+
+
+def reachable_parameters(pkg, index, material_export, params=None):
+    """Names of the VectorParameters this material's graph actually reads."""
+    return _reachable(pkg, index, material_export, params)[1]
+
+
+def _reachable(pkg, index, material_export, params=None):
+    """(texture keys, vector parameter names) reachable through live branches.
+
+    Its own traversal rather than `_collect`'s. That one follows a fixed list of
+    inputs chosen for hunting a diffuse, and a fog sheet's only texture hangs
+    off a `DepthBiasedAlpha.Alpha` -- not on the list, so the walk stopped one
+    node short of everything that mattered. Widening the diffuse walk instead
+    would change which texture every material in every map resolves to, to
+    answer a question about reachability. So this follows *every* property that
+    resolves to a MaterialExpression, and answers only that question.
+    """
+    props, start, _end = read_object_properties(pkg, material_export)
+    if start is None:
+        return set(), set()
+    found = set()
+    vectors = set()
+    seen = set()
+
+    def visit(owner, export, depth):
+        if depth <= 0 or export.index in seen:
+            return
+        seen.add(export.index)
+        tex_owner, tex = _texture_of(owner, index, export)
+        if tex is not None:
+            found.add((tex_owner.path, tex.index))
+            return
+        node, node_start, _e = read_object_properties(owner, export)
+        if node_start is None:
+            return
+        if owner.class_name_of(export) == "MaterialExpressionVectorParameter":
+            name = str(node.get("ParameterName", ""))
+            if name:
+                vectors.add(name)
+        keys = None
+        if owner.class_name_of(export) == "MaterialExpressionStaticSwitchParameter":
+            keys = (live_branch(owner, index, export, node, params),)
+        for key, _i, _t, value in node:
+            if keys is not None and key not in keys:
+                continue
+            ref = _expression_ref(value)
+            if ref is None and hasattr(value, "is_null") and not value.is_null:
+                ref = value
+            if ref is None or ref.is_null:
+                continue
+            sub_owner, sub = index.resolve(owner, ref)
+            if sub is None or "MaterialExpression" not in sub_owner.class_name_of(sub):
+                continue
+            visit(sub_owner, sub, depth - 1)
+
+    for key in _MATERIAL_INPUTS:
+        ref = _expression_ref(props.get(key))
+        if ref is None or ref.is_null:
+            continue
+        owner, export = index.resolve(pkg, ref)
+        if export is not None:
+            visit(owner, export, 24)
+    return found, vectors
 
 
 # resolve_diffuse's return type is fixed by its callers, so the expression it
@@ -382,8 +588,19 @@ def names_diffuse_slot(parameter):
     return any(token in low for token in DIFFUSE_SLOTS)
 
 
-def resolve_diffuse(pkg, index, ref, depth=12, reject=None):
-    """Resolve a material reference to (Package, Texture2D export), or (None, None)."""
+def resolve_diffuse(pkg, index, ref, depth=12, reject=None, params=None):
+    """Resolve a material reference to (Package, Texture2D export), or (None, None).
+
+    `params` carries the instance chain's parameter overrides so that static
+    switches can be evaluated on the way down -- see live_branch. It is
+    collected once from the *outermost* reference and passed unchanged into the
+    recursion, because that is where the overrides live: by the time the walk
+    reaches the base Material, the leaf that set them is several levels behind.
+    """
+    if params is None:
+        from . import graph as G
+
+        params = G.collect_parameters(pkg, index, ref)
     owner, export = index.resolve(pkg, ref)
     if export is None:
         return None, None
@@ -398,9 +615,12 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None):
 
     if cls in ("MaterialInstanceConstant", "MaterialInstanceTimeVarying"):
         best = None
-        params = props.get("TextureParameterValues")
-        if params is not None and len(params):
-            for entry in params.as_props():
+        declared = None
+        # Not to be confused with `params`, the instance chain's scalar/vector/
+        # switch overrides: these are the texture slots this instance replaces.
+        overrides = props.get("TextureParameterValues")
+        if overrides is not None and len(overrides):
+            for entry in overrides.as_props():
                 value = entry.get("ParameterValue")
                 if value is None or value.is_null:
                     continue
@@ -408,9 +628,17 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None):
                 if tex is None or tex_owner.class_name_of(tex) != "Texture2D":
                     continue
                 name = str(entry.get("ParameterName", tex.name))
+                channel = declared_diffuse_channel(name)
+                if channel is not None and declared is None:
+                    declared = (tex_owner, tex, channel)
                 score = score_texture_name(name) + score_texture_name(tex.name)
                 if best is None or score < best[0]:
                     best = (score, tex_owner, tex, names_diffuse_slot(name))
+        # A declared channel settles it: the material has said outright where
+        # its colour lives, so neither the scoring nor the parent gets a vote.
+        if declared is not None:
+            _LAST_ALBEDO[0] = declared[2]
+            return declared[0], declared[1]
         # An instance that overrides only some parameters must not short-circuit
         # its parent. CTF-FacingWorlds' cliffs are the case: the instance
         # overrides Normal alone, so the only texture it names is a normal map,
@@ -420,7 +648,8 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None):
         parent = props.get("Parent")
         inherited = (None, None)
         if parent is not None and not parent.is_null:
-            inherited = resolve_diffuse(owner, index, parent, depth - 1, reject)
+            inherited = resolve_diffuse(owner, index, parent, depth - 1, reject,
+                                        params)
         if best is not None and inherited[1] is not None:
             # The pixel test outranks the names. An instance often overrides
             # nothing but maps that are not colour at all: WAR-Serenity's cliffs
@@ -430,20 +659,26 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None):
             # parameter called DiffuseTexture. Both score -20, so the names
             # cannot separate them and the bake wins on graph position -- and
             # the cliff renders as a pale, flat lightmap.
+            # An override that *names* the diffuse slot settles it before any
+            # guessing. The relief-bake test below reads pixels, and its own
+            # docstring says it is only for candidates that names cannot
+            # separate -- but a bright, desaturated tiling texture looks exactly
+            # like a bake to it. TOXIKK's panels are the case:
+            # T_HighTechPanels_D measures 0.739 brightness at 0.008 saturation,
+            # further into the bake region than WAR-PowerSurge's genuine bake,
+            # while its parameter is called "DiffuseMap" outright. Guessing over
+            # a material's own statement painted 111 of BL-Dekk's meshes with
+            # the mud texture its parent happened to carry.
+            if best[3] and score_texture_name(best[2].name) < NOT_DIFFUSE:
+                return best[1], best[2]
             if reject is not None:
                 if reject(best[1], best[2]) and not reject(*inherited):
                     return inherited
-            # An override of the diffuse slot *by name* settles it. The instance
-            # is stating what this material is painted with, where the parent
-            # only carries the default its author left in the slot, and those
-            # defaults are engine placeholders: DM-HeatRay's rubble inherits
-            # M_Shader_Simple, whose Diffuse parameter defaults to
-            # Engine_MI_Shaders.T_Diffuse -- a 32x32 flat grey. Worse, the name
-            # is why it wins: "T_Diffuse" scores -20 for saying diffuse while
-            # the real T_HU_Deco_SM_RubbleA_D02 scores 0, so the placeholder
-            # beats the texture it stands in for.
-            if best[3] and score_texture_name(best[2].name) < NOT_DIFFUSE:
-                return best[1], best[2]
+            # (The explicit-slot check that used to sit here now runs above,
+            # ahead of the relief-bake test. It is what keeps DM-HeatRay's
+            # rubble off Engine_MI_Shaders.T_Diffuse, the 32x32 flat grey its
+            # parent leaves in the slot -- a placeholder that wins the name
+            # contest precisely because it is called "T_Diffuse".)
             # Otherwise compare on the texture alone: the parameter name helped
             # choose among this instance's own overrides, but what gets drawn is
             # the texture, and that is what the two candidates differ in.
@@ -463,14 +698,14 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None):
         if expr is None:
             continue
         found_owner, found, sample = _walk(expr_owner, index, expr, depth, set(),
-                                            reject, export.name)
+                                            reject, export.name, params)
         if found is not None:
             if sample is not None:
                 _LAST_SAMPLE[0] = (found_owner, sample)
             return found_owner, found
 
     # Fall back to whichever of the material's own textures looks most diffuse.
-    candidates = _subobject_textures(owner, index, export)
+    candidates = _subobject_textures(owner, index, export, params)
     if candidates:
         return min(candidates, key=lambda ot: score_texture_name(ot[1].name))
     return None, None
@@ -488,3 +723,375 @@ def material_uv_channel(pkg, index, ref, depth=12):
         return 0, 1.0, 1.0
     sample_owner, sample = _LAST_SAMPLE[0]
     return sample_coordinates(sample_owner, index, sample)
+
+
+# The inputs a colour can come out of, in the order a UE2 surface wants them.
+# Diffuse first: a lit material's colour is its diffuse, and its emissive is an
+# extra glow on top. For an unlit one there is no diffuse at all and emissive
+# is the whole of it.
+COLOUR_INPUTS = ("DiffuseColor", "EmissiveColor")
+
+
+def base_material(pkg, index, ref, depth=8):
+    """The Material at the end of an instance chain: (package, export, props).
+
+    A `MaterialInstanceConstant` states parameter overrides and nothing else --
+    BlendMode, LightingModel, TwoSided and the expression graph all live on the
+    Material it eventually rests on.
+    """
+    while depth > 0 and ref is not None and not ref.is_null:
+        owner, export = index.resolve(pkg, ref)
+        if export is None:
+            return None, None, None
+        props, start, _end = read_object_properties(owner, export)
+        if start is None:
+            return None, None, None
+        parent = props.get("Parent")
+        if parent is None or parent.is_null:
+            return owner, export, props
+        pkg, ref, depth = owner, parent, depth - 1
+    return None, None, None
+
+
+def constant_colour(pkg, index, ref):
+    """The flat colour a material's graph computes, as (R, G, B) bytes, or None.
+
+    Only when the material's colour input folds to a constant -- see
+    `ut3/objects/graph.py`. A material with a texture in its colour path
+    returns None here and is drawn with the texture instead, which is the right
+    answer: the texture already carries the colour.
+
+    This is what a UT3 glow actually is. `M_EV_FogSheet_Master_01` computes its
+    EmissiveColor as `Color.rgb * Color.a` and nothing else, and every goo pit,
+    steam vent and light shaft in the game is one instance overriding that
+    parameter. Resolved as "a texture" it comes out white.
+    """
+    from . import graph as G
+
+    owner, export, props = base_material(pkg, index, ref)
+    if props is None:
+        return None
+    params = G.collect_parameters(pkg, index, ref)
+    for key in COLOUR_INPUTS:
+        expr = _expression_ref(props.get(key))
+        if expr is None or expr.is_null:
+            continue
+        # The *first connected* colour input is the one that defines the
+        # surface, and if it does not fold then the material's colour is in a
+        # texture and there is no constant tint. Falling through to the next
+        # input instead is how TOXIKK's `SF_M_SnowBarrier` came to be tinted
+        # black: its DiffuseColor is a texture, so it declined, and its unused
+        # EmissiveColor folded to zero -- which as a ColorModifier multiplies
+        # the barrier away entirely.
+        folded = G.fold(owner, index, expr, params)
+        if folded is None:
+            return None
+        colour = G.to_color(folded)[:3]
+        # Black is not a tint anyone writes. It is an input left at zero, and
+        # multiplying by it erases the surface, so the texture is drawn as it
+        # is instead.
+        return None if colour == (0, 0, 0) else colour
+    return None
+
+
+def material_panner(pkg, index, ref):
+    """(PanDirection yaw, PanRate) for a material that scrolls, or None.
+
+    UT3 scrolls with a `Panner` node on the texture coordinates and UT2004 has
+    `TexPanner`, which states the same thing as a rotator and a rate. The two
+    conventions line up exactly, which took checking rather than assuming:
+
+    * Both offset the texture *coordinates* by speed times time. UE3's Panner
+      is `UV + Time * (SpeedX, SpeedY)`; `UTexPanner::GetMatrix`
+      (Engine/Src/UnMaterial.cpp:500) builds a translation of
+      `PanRate * PanDirection.Vector()` and UE2 applies it the same way round.
+    * **V is not flipped, despite appearances.** `ut2/ase.py` writes `1.0 - v`
+      and the ASE importer computes `1.0 - ST.Y` back
+      (Editor/Src/UnStaticMesh.cpp:1048), so the two cancel and a converted
+      mesh carries UT3's own UVs; the BSP surface writer never flips at all.
+      This function used to negate SpeedY for a flip that does not survive to
+      the data, which reversed every panning material along V -- reported as
+      DM-HeatRay's light cones scrolling the wrong way.
+
+    So `PanRate * PanDirection.Vector() == (SpeedX, SpeedY)`, and the pair is
+    just a magnitude and an angle. UE2 pans along one axis only, which is all
+    any case in the stock maps needs.
+
+    A Panner animates the sample it is wired to and no other. So where the
+    drawn sample is known, its own Coordinates chain is the authority --
+    *including when it says there is no Panner*. HeatRay's
+    `M_HU_Deco_SM_CitySignStores` is the case: its LED underlay scrolls, the
+    sign artwork over it does not, and reading the material at large put the
+    underlay's Panner on the artwork and set the whole sign sliding.
+
+    `resolve_diffuse` leaves the sample it landed on in `_LAST_SAMPLE`, but it
+    only lands on one when the graph walk reached a texture. Where the texture
+    came instead from the last-resort "every texture this material owns" scan
+    there is no sample to ask, and the material's own Panner is the only
+    information there is -- which is right for the fog sheets and light beams,
+    whose colour path holds no texture at all.
+    """
+    from . import graph as G
+    import math
+
+    owner, export, props = base_material(pkg, index, ref)
+    if props is None:
+        return None
+
+    _LAST_SAMPLE[0] = None
+    resolve_diffuse(pkg, index, ref)
+    if _LAST_SAMPLE[0] is not None:
+        sample_owner, sample = _LAST_SAMPLE[0]
+        sample_props, start, _end = read_object_properties(sample_owner, sample)
+        if start is None:
+            return None
+        coords = _expression_ref(sample_props.get("Coordinates"))
+        if coords is None or coords.is_null:
+            return None                 # untransformed UV: this does not pan
+        found = G.find_panner(sample_owner, index, coords)
+    else:
+        found = None
+        for key in COLOUR_INPUTS + ("Opacity", "OpacityMask"):
+            expr = _expression_ref(props.get(key))
+            if expr is None or expr.is_null:
+                continue
+            found = G.find_panner(owner, index, expr)
+            if found is not None:
+                break
+    if found is None:
+        return None
+
+    speed_x, speed_y = found
+    rate = math.hypot(speed_x, speed_y)
+    if rate <= 0.0:
+        return None
+    yaw = int(round(math.atan2(speed_y, speed_x) / (2 * math.pi) * 65536)) & 0xFFFF
+    return yaw, rate
+
+
+def opacity_scale(pkg, index, ref):
+    """How far a material scales its own opacity, as 0..1.
+
+    1.0 when it does not, which is also the answer for an opaque material.
+    See `graph.constant_scale` for what is and is not taken.
+    """
+    from . import graph as G
+
+    owner, _export, props = base_material(pkg, index, ref)
+    if props is None:
+        return 1.0
+    params = G.collect_parameters(pkg, index, ref)
+    for key in ("Opacity", "OpacityMask"):
+        expr = _expression_ref(props.get(key))
+        if expr is None or expr.is_null:
+            continue
+        scale = G.constant_scale(owner, index, expr, params)
+        if scale is None:
+            return 1.0
+        return max(0.0, min(1.0, scale))
+    return 1.0
+
+
+def resolve_emissive(pkg, index, ref, reject=None):
+    """The texture a material *glows* with: (Package, Texture2D export).
+
+    (None, None) when it does not glow, or when what it glows with is the
+    texture it is already painted with -- UE3 routinely feeds one texture to
+    both DiffuseColor and EmissiveColor, and UE2 gets that from a Shader whose
+    Diffuse and SelfIllumination are the same material.
+
+    This is the half of a UT3 sign that a flat texture cannot carry. HeatRay's
+    `M_HU_Deco_SM_CitySignsTexts` paints `T_HU_Deco_SM_CitySign01b_D` and glows
+    `T_HU_Deco_SM_CitySignsTexts_E` on top of it at fifteen times brightness;
+    drawn as the diffuse alone the sign is there but dead. UE2's Shader has
+    exactly the two slots.
+
+    `reject` is the caller's pixel test. The engine's placeholder emissive is a
+    32x32 flat image (`UN_Shaders.T_Diffuse` measures mean 128 with a spread of
+    zero), and a flat emissive is not a glow: it is either a slot nobody filled
+    or a uniform brightening, and either way it would wash the surface out.
+    """
+    from . import graph as G
+
+    owner, export, props = base_material(pkg, index, ref)
+    if props is None:
+        return None, None
+    params = G.collect_parameters(pkg, index, ref)
+
+    # A material that says outright it does not glow, does not glow. This is a
+    # statement rather than a heuristic and it outranks the graph walk, which
+    # can reach a texture through a path the switch does not gate: TOXIKK's
+    # `M_HighTechPanel_EdenParticles_INST` sets bUseEmissive False and still
+    # leads to `SF_T_GroundHeightmaps`, and a heightmap drawn as light is the
+    # rainbow sheen reported on BL-Dekk's wall panels.
+    for name, value in params.switches.items():
+        if name.lower().replace(" ", "") == "buseemissive" and not value:
+            return None, None
+
+    expr = _expression_ref(props.get("EmissiveColor"))
+    if expr is None or expr.is_null:
+        return None, None
+    expr_owner, expr_export = index.resolve(owner, expr)
+    if expr_export is None:
+        return None, None
+    found_owner, found, _sample = _walk(expr_owner, index, expr_export, 12, set(),
+                                        None, None, params)
+    if found is None:
+        return None, None
+    if reject is not None and reject(found_owner, found):
+        return None, None
+
+    diffuse_owner, diffuse = resolve_diffuse(pkg, index, ref)
+    if diffuse is not None and diffuse_owner is found_owner \
+            and diffuse.index == found.index:
+        return None, None
+    return found_owner, found
+
+
+# Vector parameters that tint the diffuse map rather than replacing it. Matched
+# only when the material's graph actually reads the parameter -- see
+# diffuse_tint -- so the name narrows a candidate rather than deciding one.
+_DIFFUSE_TINTS = ("diffusecolor", "basecolor", "diffusetint", "color", "tint")
+
+
+def diffuse_tint(pkg, index, ref):
+    """The constant colour a material multiplies its diffuse map by, or None.
+
+    UE3 routinely paints one texture a dozen ways with a vector parameter.
+    TOXIKK does it heavily: 14 of BL-Dekk's 31 material instances carry a
+    non-white `DiffuseColor`, and some are not subtle -- its landing pools are
+    (0.04, 0.073, 0.243), a deep blue, drawn from an untinted grey texture.
+    UT2004 expresses exactly this with a `ColorModifier`.
+
+    Distinct from `constant_colour`, and the two cannot both fire: that one
+    answers materials whose colour input folds to a constant *because there is
+    no texture in it*, which is a flat glow. This one answers a material that
+    does draw a texture and multiplies it.
+
+    Two conditions. The parameter has to be named like a tint, and it has to be
+    one the graph actually reads -- a chain of instances accumulates parameters
+    that later revisions stopped using, and `reachable_parameters` walks only
+    the branches the material compiles. White is refused as a no-op, and so is
+    a value above 1, which is a brightness boost rather than a tint and would
+    clip to white in a byte.
+    """
+    from . import graph as G
+
+    owner, base, props = base_material(pkg, index, ref)
+    if props is None:
+        return None
+    params = G.collect_parameters(pkg, index, ref)
+    live = reachable_parameters(owner, index, base, params)
+    if not live:
+        return None
+
+    best = None
+    pkg_at, ref_at, depth = pkg, ref, 8
+    while depth > 0 and ref_at is not None and not ref_at.is_null:
+        owner_at, export_at = index.resolve(pkg_at, ref_at)
+        if export_at is None:
+            break
+        at_props, start, _end = read_object_properties(owner_at, export_at)
+        if start is None:
+            break
+        array = at_props.get("VectorParameterValues")
+        if array is not None and len(array):
+            for entry in array.as_props():
+                name = str(entry.get("ParameterName", ""))
+                if name not in live:
+                    continue
+                if name.lower().replace(" ", "") not in _DIFFUSE_TINTS:
+                    continue
+                value = entry.get("ParameterValue")
+                if isinstance(value, Struct) and value.value is not None:
+                    best = tuple(float(v) for v in value.value[:3])
+                    break
+        if best is not None:
+            break
+        parent = at_props.get("Parent")
+        if parent is None or parent.is_null:
+            break
+        pkg_at, ref_at, depth = owner_at, parent, depth - 1
+
+    if best is None or any(v > 1.0 for v in best):
+        return None
+    # A two-tone material has both of its colours baked into the texture
+    # already, so tinting on top would apply the body colour twice.
+    if diffuse_blend(pkg, index, ref) is not None:
+        return None
+    colour = G.to_color(best)[:3]
+    # White multiplies by one, so it is a no-op that costs a texture stage.
+    # Black is refused for the same reason `constant_colour` refuses it: it
+    # erases the surface, and a UE3 material that tints something black
+    # generally does so through a mask this cannot follow rather than over the
+    # whole texture.
+    if colour in ((255, 255, 255), (0, 0, 0)):
+        return None
+    return colour
+
+
+def _live_vectors(pkg, index, ref, live, depth=8):
+    """{name: (r, g, b)} for live vector parameters, leaf first."""
+    out = {}
+    while depth > 0 and ref is not None and not ref.is_null:
+        owner, export = index.resolve(pkg, ref)
+        if export is None:
+            break
+        props, start, _end = read_object_properties(owner, export)
+        if start is None:
+            break
+        array = props.get("VectorParameterValues")
+        if array is not None and len(array):
+            for entry in array.as_props():
+                name = str(entry.get("ParameterName", ""))
+                if name not in live:
+                    continue
+                value = entry.get("ParameterValue")
+                if isinstance(value, Struct) and value.value is not None:
+                    out.setdefault(name, tuple(float(v) for v in value.value[:3]))
+        parent = props.get("Parent")
+        if parent is None or parent.is_null:
+            break
+        pkg, ref, depth = owner, parent, depth - 1
+    return out
+
+
+def diffuse_blend(pkg, index, ref):
+    """(channel, colour one, colour two) where a material is two-tone, or None.
+
+    TOXIKK paints a panel with two colours chosen per pixel by one channel of
+    the diffuse map: `DiffuseColor` for the body, `DiffuseColor2` for the trim,
+    `DiffuseColorMaskChannel` saying which channel picks between them, and
+    `bUseDiffuseColor2` saying whether any of it applies. **32 of BL-Dekk's
+    materials do this** -- a third of the map -- and none of DM-Deck's, so it is
+    an asset-authoring style rather than something UE3 does generally.
+
+    Applying only the first colour is what made a pipe "appear as a flat
+    texture": its body is red and its trim near-white, and multiplying the
+    whole texture by red loses the trim entirely. The floor panels are worse,
+    blending warm white against near-black.
+
+    Colours come back linear, for the caller to multiply in that space before
+    converting once at the end.
+    """
+    from . import graph as G
+
+    owner, base, props = base_material(pkg, index, ref)
+    if props is None:
+        return None
+    params = G.collect_parameters(pkg, index, ref)
+    if not params.switches.get("bUseDiffuseColor2"):
+        return None
+    channel = params.masks.get("DiffuseColorMaskChannel")
+    if channel is None:
+        return None
+    live = reachable_parameters(owner, index, base, params)
+    if not live:
+        return None
+    values = _live_vectors(pkg, index, ref, live)
+    first, second = values.get("DiffuseColor"), values.get("DiffuseColor2")
+    if first is None or second is None or first == second:
+        return None
+    if any(v > 1.0 for v in first + second):
+        return None
+    return channel, first, second

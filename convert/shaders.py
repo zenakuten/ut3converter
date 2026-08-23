@@ -14,23 +14,59 @@ There is no texture anywhere in the visible path; the texture a naive resolver
 lands on (`T_EV_DustPanner_01`) comes from a disabled `UseTextureOverlay`
 branch. Assigning it produces a solid grey slab where UT3 draws a soft glow.
 
-**These cannot be converted from a `ucc make` build.** UT2004 would need a
-Shader or FinalBlend, and nothing in a script build can create one: the texture
-import exec only makes Texture objects, and no editor factory has bCreateNew.
-Nor can a generated class smuggle one in -- a `Begin Object` block in
-defaultproperties creates an *inline* subobject on the class default object,
-never a package object, and UT2004 references are `Class'Package.Group.Object'`
-with an optional group and no sub-object level, so no path could name it.
+(Phase 14d fixed that half: `material.live_branch` follows only the side of a
+static switch UE3 actually compiles, so these now resolve
+`T_EV_LightBeam_Falloff_02` -- the texture the material really samples.)
 
-What a plain Texture can express is limited to bMasked, bAlphaTexture and
-bTwoSided (Engine/Texture.uc:37-39): alpha-blended translucency is reachable,
-additive is not.
+**A `ucc make` build CAN create a Shader or FinalBlend.** This file used to
+say the opposite; the claim was wrong on both halves, and `ShaderLab/` at the
+install root is the probe that settled it.
 
-So these actors are skipped by default. UE2 would render them as overlapping
-alpha-blended quads, which costs fill rate for something that would not look
-right regardless. Pass --keep-effect-meshes to convert them anyway (they will
-appear as opaque surfaces), or build a .utx of FinalBlends by hand in UnrealEd
-if a faithful result is wanted.
+A `Begin Object` block in defaultproperties is constructed with
+`Outer = InParent` and `RF_Public`, and during `ImportPropertiesScripts`
+InParent is `Class->GetOuter()` -- the class's own *package*
+(Editor/Src/UnEditor.cpp:824, and `GEditor->Bootstrapping` is zero there, being
+raised only around `#exec`). So the object lands in the package root exactly
+like an `#exec TEXTURE IMPORT`ed Texture, and `UObject::ResolveName`
+(Core/Src/UnObj.cpp:3648) walks '.' to arbitrary depth, so `Package.Object`
+names it in a t3d, an actor property or another package's import table.
+`editinlinenew` has nothing to do with it -- ImportProperties never reads the
+flag, and `ColorModifier` (`noteditinlinenew`) builds just as happily.
+
+Two conditions, both learned the hard way:
+
+* **Something must reference the material or it is not saved.** SavePackage
+  writes only tagged objects. The first probe defined a TexPanner, a TexScaler,
+  a Combiner, a Shader and a FinalBlend, referenced none of them, and produced
+  a package containing none of them -- silently, with no error. A
+  `var array<Material> KeepAlive;` on the generated class, filled in
+  defaultproperties, is what holds them.
+* **Order matters within one `ucc make`.** A package is only resolvable by a
+  later one if it appears earlier in EditPackages.
+
+What a plain Texture can express, by contrast, is limited to bMasked,
+bAlphaTexture and bTwoSided (Engine/Texture.uc:37-39): alpha-blended
+translucency is reachable, additive is not. That limit is what drove every
+substitution below, and it no longer binds.
+
+So the skipping below is now the *fallback*, not the rule. `effect_is_drawable`
+keeps an effect actor whenever a UE2 material can be built for it -- which needs
+a non-opaque blend mode and a real texture -- and only what fails both goes on
+being dropped. `--no-materials` restores the old behaviour exactly, and
+`--keep-effect-meshes` still forces every effect through as an opaque surface.
+
+The remaining cost is fill rate: UE2 draws these as overlapping alpha-blended
+quads, and a map with a lot of haze pays for it in overdraw rather than in
+triangles.
+
+What converts is more than the blend mode. `ut3/objects/graph.py` folds a UE3
+expression graph to a constant where it can, which is what recovers the colour
+of a material with no texture in its colour path at all -- and that is most of
+UT3's volumetric effects, including the fog sheet above: `M_EV_FogSheet_Master_01`
+computes EmissiveColor as `Color.rgb * Color.a` and every goo pit and light
+shaft in the game is one instance overriding that parameter. `build_material`
+below turns the result into a ColorModifier, a Panner into a TexPanner, and the
+blend mode into a FinalBlend.
 
 Note the deliberately narrow test. It requires *all three* of unlit shading, a
 non-opaque blend mode, and no DiffuseColor input at all:
@@ -43,6 +79,8 @@ non-opaque blend mode, and no DiffuseColor input at all:
   VectorParameter and whose alpha is DepthBiasedAlpha -- are skipped.
 """
 
+from ut3.objects.material import (MASKED_BLEND, constant_colour, diffuse_tint,
+                                  material_panner, opacity_scale)
 from ut3.props import read_object_properties
 
 # Blend modes that, combined with unlit shading, mark a volumetric effect.
@@ -79,6 +117,14 @@ def material_is_effect(pkg, index, ref):
 # DM-Deck's goo pits are the case that matters: three S_EV_FogSheet_01 sheets
 # wearing M_HU_Deck_Goo_Translucent and M_UN_Volumetrics_TexturedFogSheet_01_Goo.
 # Skipped as effects, the pit that kills you is invisible.
+#
+# Still worth it after Phase 14, and checked rather than assumed. The goo
+# surface takes its colour from a cubemap reflection tinted (2.0, 4.0, 0.4);
+# cubemaps are refused as colour maps and this pipeline exports none, so a
+# generated material would fall back to T_EV_DustPanner_01 -- near-uniform grey
+# (mean 126 over 106..164). A flat grey slab against an animated goop. The
+# vertical haze around the pit is a different material and does convert.
+
 EFFECT_SUBSTITUTES = (
     ("goo", "FinalBlend'XEffectMat.goop.GoopFB'"),
     ("slime", "FinalBlend'XEffectMat.goop.GoopFB'"),
@@ -336,3 +382,273 @@ def mesh_is_effect(pkg, index, mesh_ref, cache=None):
     if cache is not None:
         cache[key] = result
     return result
+
+
+# ---------------------------------------------------------------------------
+# Building a UE2 material rather than settling for a flat texture.
+# ---------------------------------------------------------------------------
+#
+# The mapping is Epic's own, read out of XEffectMat.utx rather than invented:
+# an additive glow is a FinalBlend with FB_Brighten, ZWrite off and TwoSided on
+# over a plain Texture (`Link.LinkBeamBlueFB`); an alpha-blended effect is
+# FB_Translucent over a Shader (`goop.GoopFB` over `goop.GoopShader`); and
+# "unlit" is expressed by giving a Shader the same material for Diffuse and
+# SelfIllumination, which is exactly what GoopShader does.
+#
+# EFrameBufferBlending, from Engine/FinalBlend.uc.
+# Read out of D3D9MaterialState.cpp:299 rather than chosen by feel:
+#   FB_Brighten    SRCALPHA / ONE            additive, scaled by source alpha
+#   FB_AlphaBlend  SRCALPHA / INVSRCALPHA    what BLEND_Translucent means
+#   FB_Translucent ONE / INVSRCCOLOR         keyed on brightness, not alpha
+#   FB_Modulate    DESTCOLOR / SRCCOLOR
+# BLEND_Translucent maps to FB_AlphaBlend, which is exact -- but only where the
+# texture has an alpha channel to blend on. build_material falls back to
+# FB_Translucent where it does not; see there.
+FRAME_BUFFER_BLENDING = {
+    "BLEND_Additive": "FB_Brighten",
+    "BLEND_Translucent": "FB_AlphaBlend",
+    "BLEND_Modulate": "FB_Modulate",
+}
+
+
+def _base_material_props(pkg, index, ref, depth=6):
+    """The properties of the Material a reference ultimately rests on.
+
+    A `MaterialInstanceConstant` states almost nothing itself -- BlendMode,
+    LightingModel and TwoSided live on the parent Material at the end of the
+    chain, which is why every caller here has to walk it rather than read the
+    instance.
+    """
+    while depth > 0:
+        if ref is None or ref.is_null:
+            return None, None
+        owner, export = index.resolve(pkg, ref)
+        if export is None:
+            return None, None
+        props, start, _end = read_object_properties(owner, export)
+        if start is None:
+            return None, None
+        if props.get("BlendMode") is not None or props.get("LightingModel") is not None:
+            return owner, props
+        parent = props.get("Parent")
+        if parent is None or parent.is_null:
+            return owner, props
+        pkg, ref, depth = owner, parent, depth - 1
+    return None, None
+
+
+def surface_style(pkg, index, ref):
+    """(blend mode, unlit, two-sided) for a UE3 material reference.
+
+    Blend is UE3's own `BLEND_*` name, so the caller decides what UE2 makes of
+    it; `BLEND_Opaque` when nothing says otherwise.
+    """
+    _owner, props = _base_material_props(pkg, index, ref)
+    if props is None:
+        return "BLEND_Opaque", False, False
+    blend = str(props.get("BlendMode", "BLEND_Opaque"))
+    unlit = str(props.get("LightingModel", "MLM_Phong")) == "MLM_Unlit"
+    return blend, unlit, props.get("TwoSided") is True
+
+
+def build_material(material_set, texture_set, pkg, index, ref,
+                   texture_path, base_name, glow_path=None):
+    """Build UE2 material objects for one non-opaque UT3 material.
+
+    Returns (outermost object name, (name, blend, unlit, colour, panner)) --
+    the second half is only for reporting -- or (None, None) when a plain
+    Texture already says everything UE2 can say.
+
+    The shape is Epic's, read out of `XEffectMat.utx`: a texture, optionally
+    under a `TexPanner`, optionally under a `Shader` that self-illuminates it,
+    optionally under a `ColorModifier` that tints it, and a `FinalBlend` on the
+    outside deciding how it meets the framebuffer. Every one of those is a
+    `UModifier` except the Shader, and the render interface accumulates the
+    whole chain into one state (D3D9RenderInterface.h:395), so they compose.
+    """
+    blend, unlit, two_sided = surface_style(pkg, index, ref)
+    framebuffer = FRAME_BUFFER_BLENDING.get(blend)
+    colour = constant_colour(pkg, index, ref)
+    if colour is None and texture_path is not None:
+        # A material that draws a texture and multiplies it by a constant. The
+        # two are mutually exclusive by construction and have to stay that way:
+        # `constant_colour` only answers when the colour input folds whole,
+        # which needs no texture in it, and on DM-Deck every material with a
+        # tint also folds -- applying both would square the colour.
+        colour = diffuse_tint(pkg, index, ref)
+    panner = material_panner(pkg, index, ref)
+    scale = opacity_scale(pkg, index, ref) if framebuffer else 1.0
+
+    if texture_path is None and colour is None:
+        return None, None
+    if framebuffer is None and not unlit and glow_path is None:
+        # A masked surface is already fully expressed by the texture's own
+        # MASKED=1 and the opacity bake in convert/textures.py.
+        if panner is None and colour is None:
+            return None, None
+
+    if texture_path is None:
+        # No texture in the graph at all: the material *is* a colour. UT3 draws
+        # a good many flares and falloff spheres this way.
+        inner = material_set.add("ConstantColor", base_name,
+                                 [("Color", _color(colour))])
+        colour = None
+    else:
+        inner = None
+        kind = "Texture"
+        current = texture_path
+        if panner is not None:
+            yaw, rate = panner
+            inner = material_set.add("TexPanner", base_name, [
+                ("Material", "%s'%s'" % (kind, current)),
+                ("PanDirection", "(Yaw=%d)" % yaw),
+                ("PanRate", "%f" % rate),
+            ])
+            kind, current = "TexPanner", material_set.bare_path(inner)
+        if unlit or glow_path is not None:
+            # Two different things, one object. Unlit: UE3 says the lighting
+            # pass must not touch this, and UE2 has no such flag on a Texture,
+            # so it takes the Shader that XEffectMat's goop uses -- the same
+            # material in Diffuse and SelfIllumination, with no
+            # SelfIlluminationMask, leaving nothing for lighting to modulate.
+            # Glowing: the surface is lit normally and a *second* texture is
+            # added on top, which is what the two slots are for. HeatRay's city
+            # signs are the case -- painted `..._D`, glowing `..._E`.
+            shader = [("Diffuse", "%s'%s'" % (kind, current))]
+            if glow_path:
+                # The mask is the glow itself, whose alpha carries its own
+                # luminance (convert/textures.py: bake_self_alpha). Setting it
+                # is not optional: SelfIllumination *without* a mask replaces
+                # the diffuse and unlits the surface entirely
+                # (D3D9MaterialState.cpp:972), which for a city sign draws its
+                # near-black `..._E` texture on its own. With the mask the
+                # engine blends the glow over the lit diffuse instead.
+                shader.append(("SelfIllumination", "Texture'%s'" % glow_path))
+                shader.append(("SelfIlluminationMask", "Texture'%s'" % glow_path))
+            else:
+                shader.append(("SelfIllumination", "%s'%s'" % (kind, current)))
+            if framebuffer is None and blend == MASKED_BLEND:
+                # No FinalBlend will wrap this one, so the Shader's own
+                # OutputBlending is what decides. OB_Normal with no Opacity
+                # turns AlphaTest off outright (D3D9MaterialState.cpp:1521),
+                # which would draw a cutout solid and lose the mask the
+                # texture's own MASKED=1 was imported for.
+                shader.append(("OutputBlending", "OB_Masked"))
+            if two_sided and framebuffer is None:
+                shader.append(("TwoSided", "True"))
+            inner = material_set.add("Shader", base_name, shader)
+
+    kind = material_set.definitions[inner][0] if inner else "Texture"
+    current = material_set.bare_path(inner) if inner else texture_path
+
+    if framebuffer == "FB_AlphaBlend" and not _has_alpha(texture_set, base_name):
+        # BLEND_Translucent means SRCALPHA/INVSRCALPHA in both engines, but a
+        # texture with no alpha channel reads as alpha 1 and draws solid. UE2's
+        # own FB_Translucent is ONE/INVSRCCOLOR (D3D9MaterialState.cpp:325) --
+        # keyed on brightness rather than alpha, so black is transparent. For a
+        # beam or a fog sheet, whose UE3 opacity comes from a depth fade no
+        # build can evaluate, that is the closest thing available and it is
+        # what the texture was drawn for.
+        framebuffer = "FB_Translucent"
+
+    # Where the material scales its own opacity, UE2 has two places to put it
+    # and which one depends on the blend. FB_AlphaBlend and FB_Brighten are
+    # both driven by source alpha, so it goes in the ColorModifier's alpha;
+    # FB_Translucent is ONE/INVSRCCOLOR and ignores alpha entirely, so there
+    # the level *is* the brightness and it scales the colour instead.
+    alpha = 255
+    if scale < 1.0:
+        if framebuffer in ("FB_AlphaBlend", "FB_Brighten"):
+            alpha = max(0, min(255, int(round(255.0 * scale))))
+        elif framebuffer == "FB_Translucent":
+            base = colour or (255, 255, 255)
+            colour = tuple(max(0, min(255, int(round(c * scale)))) for c in base)
+
+    # White at full alpha multiplies by one: the object would be created,
+    # serialize to nothing (UCC drops a property equal to the class default)
+    # and still cost a texture stage at render time -- and stages run out,
+    # "No stages left for constant color modifier" being a real failure path
+    # (D3D9MaterialState.cpp:1751).
+    if colour == (255, 255, 255) and alpha == 255:
+        colour = None
+    if colour is not None or alpha != 255:
+        # ColorModifier multiplies the material under it by a constant, colour
+        # and alpha alike (HandleTFactor_SP, D3D9MaterialState.cpp:223). That
+        # is exactly what a UT3 glow is: one greyscale falloff texture worn by
+        # a dozen instances differing only in a colour and an opacity. Without
+        # it DM-Deck's seven light beams are one white beam seven times, at
+        # twenty times the strength UT3 draws them.
+        inner = material_set.add("ColorModifier", base_name, [
+            ("Material", "%s'%s'" % (kind, current)),
+            ("Color", _color(colour or (255, 255, 255), alpha)),
+            # Both default True, and both have to be turned off. `AlphaBlend`
+            # rewrites a surface still at ONE/ZERO into SRCALPHA/INVSRCALPHA
+            # (D3D9MaterialState.cpp:1735), so a *tint* on an opaque wall makes
+            # it translucent -- which is why BL-Dekk's tinted floors and pipes
+            # came out see-through and popping in and out of each other as the
+            # camera moved, translucent surfaces being sorted per actor.
+            # `RenderTwoSided` is ORed in the same way and would force
+            # two-sidedness on geometry UT3 draws one-sided. Where a surface
+            # really is blended or two-sided the FinalBlend above says so.
+            ("AlphaBlend", "False"),
+            ("RenderTwoSided", "False"),
+        ])
+        kind, current = "ColorModifier", material_set.bare_path(inner)
+
+    if framebuffer is None:
+        # A masked surface: the texture's own MASKED=1 does the cutout and
+        # there is no framebuffer blend to state. Whatever was built above --
+        # a panner, a self-illuminating Shader, a tint -- is the whole answer.
+        return inner, (inner, blend, unlit, colour, panner)
+
+    properties = [
+        ("Material", "%s'%s'" % (kind, current)),
+        ("FrameBufferBlending", framebuffer),
+        # An effect that writes depth sorts against itself and punches holes in
+        # whatever is drawn after it. Epic turns it off on every one of
+        # XEffectMat's blended materials.
+        ("ZWrite", "False"),
+    ]
+    if two_sided:
+        properties.append(("TwoSided", "True"))
+    built = material_set.add("FinalBlend", base_name, properties)
+    return built, (built, blend, unlit, colour, panner)
+
+
+def _color(rgb, alpha=255):
+    return "(R=%d,G=%d,B=%d,A=%d)" % (rgb[0], rgb[1], rgb[2], alpha)
+
+
+def _has_alpha(texture_set, name):
+    """Did the exported texture end up with an alpha channel worth blending on?"""
+    return bool(texture_set is not None and texture_set.alpha_channel.get(name))
+
+
+def effect_is_drawable(pkg, index, mesh_ref, overrides, texture_set, cache=None):
+    """Can this effect mesh be drawn properly now that materials can be built?
+
+    Everything at the top of this file about beams and fog sheets was written
+    when the only available answer was a flat opaque Texture, and it holds for
+    that answer: `M_EV_Lightbeam_Master_01` resolves to `T_EV_DustPanner_01`,
+    off a disabled `UseTextureOverlay` branch, and drawn opaque that is a grey
+    slab where UT3 has a soft glow.
+
+    Drawn *additively* it is not. Black contributes nothing under FB_Brighten,
+    so a dark gradient texture over an additive blend is a glow -- the objection
+    was to the blend mode, not to the texture. So an effect mesh is kept when a
+    UE2 material can actually be built for it, which needs a non-opaque blend
+    mode and then either a real texture or a colour its graph folds to. One or
+    the other is not negotiable: a material with neither would take the grey
+    placeholder, and a grey placeholder drawn additively is a bright haze over
+    everything behind it.
+    """
+    if texture_set is None or texture_set.materials is None:
+        return False
+    for owner, ref in _material_candidates(pkg, index, mesh_ref, overrides, cache):
+        blend, _unlit, _two_sided = surface_style(owner, index, ref)
+        if FRAME_BUFFER_BLENDING.get(blend) is None:
+            continue
+        if texture_set.add_material(owner, index, ref) \
+                or constant_colour(owner, index, ref):
+            return True
+    return False

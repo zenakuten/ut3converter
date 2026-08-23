@@ -1,4 +1,5 @@
-"""Folding a separate UE3 opacity mask into a texture's alpha channel.
+"""DXT surgery: folding a UE3 opacity mask into alpha, and building colour
+blocks for a material that states its albedo as one channel of a packed mask.
 
 UE3 materials routinely keep opacity in its own texture -- `..._M` alongside
 `..._D` -- because the graph can sample whatever it likes. UE2 has no such
@@ -14,6 +15,10 @@ one wrinkle is DXT1's punchthrough mode -- a block whose first endpoint is not
 greater than the second encodes three colours plus transparent, and reading that
 same block as DXT5 would turn those texels into black rather than transparent.
 Such blocks are re-encoded onto the four-colour ramp instead.
+
+`encode_dxt1_tinted` is the one place here that writes colour rather than
+copying it, and it exists because some materials never ship a colour map at
+all -- see `declared_diffuse_channel` in ut3/objects/material.py.
 """
 
 import struct
@@ -49,11 +54,24 @@ def blocks_wide(width):
 
 def decode_dxt1_channel(data, width, height, channel=0):
     """One colour channel of a DXT1 surface, as a width*height byte list."""
+    return _decode_colour_channel(data, width, height, channel, 8, 0)
+
+
+def decode_dxt5_channel(data, width, height, channel=0):
+    """One colour channel of a DXT5 surface.
+
+    A DXT5 block is sixteen bytes: eight of alpha, then eight that are a DXT1
+    colour block exactly. So this is the same decode at an offset.
+    """
+    return _decode_colour_channel(data, width, height, channel, 16, 8)
+
+
+def _decode_colour_channel(data, width, height, channel, stride, skip):
     out = bytearray(width * height)
     bw, bh = blocks_wide(width), blocks_wide(height)
     for by in range(bh):
         for bx in range(bw):
-            offset = (by * bw + bx) * 8
+            offset = (by * bw + bx) * stride + skip
             if offset + 8 > len(data):
                 continue
             c0, c1, bits = struct.unpack_from("<HHI", data, offset)
@@ -191,4 +209,115 @@ def dxt5_with_alpha(existing, alpha, width, height):
                 continue
             out += _alpha_block(alpha, width, height, bx, by)
             out += existing[offset + 8:offset + 16]
+    return bytes(out)
+
+
+def _to_565(r, g, b):
+    """Quantise an 8-bit triple to the packed 16-bit value DXT1 stores."""
+    return ((r * 31 // 255) << 11) | ((g * 63 // 255) << 5) | (b * 31 // 255)
+
+
+def encode_dxt1_tinted(values, width, height, tint):
+    """Build a DXT1 surface from a single channel multiplied by a colour.
+
+    For the material style this exists to serve -- a packed mask whose red
+    channel is the albedo, tinted by a Base Color -- every texel in a block is
+    the same colour at a different brightness, so the block's colours are
+    exactly collinear and DXT1 represents them with no loss of hue at all. The
+    endpoints are then just the block's darkest and brightest texel scaled by
+    the tint, and a texel picks whichever of the four ramp entries its own
+    brightness is nearest. That is why this encoder can be this short: the hard
+    part of DXT1 compression is choosing a line through a cloud of colours, and
+    here the line is given.
+    """
+    red, green, blue = tint
+    out = bytearray()
+    bw, bh = blocks_wide(width), blocks_wide(height)
+    for by in range(bh):
+        for bx in range(bw):
+            texels = []
+            for y in range(4):
+                row = by * 4 + y
+                for x in range(4):
+                    column = bx * 4 + x
+                    if row < height and column < width:
+                        texels.append(values[row * width + column])
+                    else:
+                        texels.append(texels[-1] if texels else 0)
+            low, high = min(texels), max(texels)
+            c0 = _to_565(min(255, int(high * red)), min(255, int(high * green)),
+                         min(255, int(high * blue)))
+            c1 = _to_565(min(255, int(low * red)), min(255, int(low * green)),
+                         min(255, int(low * blue)))
+            if c0 <= c1:
+                # A flat block, or one the quantiser collapsed. Leaving c0 <= c1
+                # would select the three-colour mode, whose fourth entry is
+                # transparent black -- so keep every index at 0 and the whole
+                # block reads as c0 whichever mode it lands in.
+                out += struct.pack("<HHI", c0, c1, 0)
+                continue
+            # Ramp entries, in DXT1's index order: c0, c1, then the two thirds.
+            span = high - low
+            bits = 0
+            for i, value in enumerate(texels):
+                position = (value - low) / span
+                if position >= 5.0 / 6.0:
+                    code = 0
+                elif position >= 0.5:
+                    code = 2
+                elif position >= 1.0 / 6.0:
+                    code = 3
+                else:
+                    code = 1
+                bits |= code << (2 * i)
+            out += struct.pack("<HHI", c0, c1, bits)
+    return bytes(out)
+
+
+def encode_dxt1_rgb(pixels, width, height):
+    """Build a DXT1 surface from full-colour pixels: [(r, g, b), ...].
+
+    `encode_dxt1_tinted` can be short because its block colours are collinear
+    by construction. These are not: a two-tone material puts a red body and a
+    pale trim in the same block, and the line has to be found rather than
+    given. It is found the cheap way -- the darkest and brightest texel as
+    endpoints -- which is exact for a block of one hue and a fair approximation
+    for a block spanning two, since a DXT1 block can only ever be a line
+    anyway.
+    """
+    out = bytearray()
+    bw, bh = blocks_wide(width), blocks_wide(height)
+    for by in range(bh):
+        for bx in range(bw):
+            texels = []
+            for y in range(4):
+                row = by * 4 + y
+                for x in range(4):
+                    column = bx * 4 + x
+                    if row < height and column < width:
+                        texels.append(pixels[row * width + column])
+                    else:
+                        texels.append(texels[-1] if texels else (0, 0, 0))
+            luma = [0.299 * t[0] + 0.587 * t[1] + 0.114 * t[2] for t in texels]
+            low = texels[luma.index(min(luma))]
+            high = texels[luma.index(max(luma))]
+            c0, c1 = _to_565(*high), _to_565(*low)
+            if c0 <= c1:
+                out += struct.pack("<HHI", c0, c1, 0)
+                continue
+            lo, hi = min(luma), max(luma)
+            span = hi - lo
+            bits = 0
+            for i, value in enumerate(luma):
+                position = (value - lo) / span
+                if position >= 5.0 / 6.0:
+                    code = 0
+                elif position >= 0.5:
+                    code = 2
+                elif position >= 1.0 / 6.0:
+                    code = 3
+                else:
+                    code = 1
+                bits |= code << (2 * i)
+            out += struct.pack("<HHI", c0, c1, bits)
     return bytes(out)
