@@ -280,20 +280,20 @@ def read_object_properties(pkg, export):
     data = pkg.export_data(export)
     window = min(len(data), PROPERTY_SCAN_WINDOW)
     # An object's property list follows whatever its class serializes natively,
-    # so where it starts has to be found rather than assumed. Aligned offsets
-    # first, which is where every UT3 export puts it and keeps that search
-    # exactly as cheap as it was.
-    for pos in range(0, window, 4):
-        parsed = _try_parse(pkg, data, pos)
-        if parsed:
-            return parsed[0], pos, parsed[1]
-    # Then the unaligned ones. UDK packages need this: a TOXIKK StaticMeshActor
-    # carries a 26-byte native prefix, so its properties begin two bytes off
-    # every multiple of four. _try_parse walks the whole list to its None
-    # terminator before accepting an offset, so a false start does not survive.
-    for pos in range(1, window):
-        if pos % 4 == 0:
-            continue
+    # so where it starts has to be found rather than assumed. **Earliest wins,
+    # aligned or not.** This used to sweep the aligned offsets first and the
+    # unaligned ones after, on the grounds that UT3 always aligns -- but that
+    # lets a false positive later in the export beat the true start earlier in
+    # it. TOXIKK's StaticMeshActors carry a 26-byte native prefix, and
+    # BL-Foundation's `StaticMeshActor_509` also parses at 236: taking the
+    # aligned 236 lost the Location, Rotation and DrawScale3D that live in the
+    # real list at 26, and dropped a 11,260-unit city block on the world
+    # origin. 491 of that map's actors were placed that way.
+    #
+    # _try_parse walks the whole list to its None terminator before accepting
+    # an offset, so a false start is unlikely; scanning in order means that
+    # when one does occur, it can only be a *later* one that loses.
+    for pos in range(window):
         parsed = _try_parse(pkg, data, pos)
         if parsed:
             return parsed[0], pos, parsed[1]

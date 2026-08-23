@@ -70,14 +70,54 @@ def _vec(r):
     return struct.unpack("<3f", r.bytes(12))
 
 
+# What an FPoly carries after LightingChannels, and whether an FName follows:
+#
+#   UT3 512          nothing
+#   UDK 868          FLightmassPrimitiveSettings (nine fields) + the
+#                    procedural-building ruleset variation name
+#   GoW 835 lic 76   a seven-field FLightmassPrimitiveSettings, no name
+#
+# A version threshold cannot separate three shapes when the middle one is the
+# odd licensee out, so the tail is worked out per package instead -- see
+# read_polys.
+FPOLY_TAILS = ((0, False), (LIGHTMASS_SETTINGS_SIZE, True), (28, False))
+
+
 def read_polys(pkg, export):
-    """Read a UPolys export into a list of Poly."""
+    """Read a UPolys export into a list of Poly.
+
+    The FPoly tail differs between builds, so each candidate shape is tried and
+    the one that consumes the export exactly is the right one. That is a much
+    stronger check than it looks: a wrong stride drifts within the first poly or
+    two and lands nowhere near the end of a 984-byte array.
+    """
     if pkg.class_name_of(export) != "Polys":
         raise ValueError("%s is a %s, not a Polys" % (export.name, pkg.class_name_of(export)))
     data = pkg.export_data(export)
     _props, start, end = read_object_properties(pkg, export)
     if start is None:
         end = 0
+    expected = (LIGHTMASS_SETTINGS_SIZE, True) if pkg.version >= UDK_FPOLY_EXTRAS \
+        else (0, False)
+    order = [expected] + [t for t in FPOLY_TAILS if t != expected]
+    cached = getattr(pkg, "_fpoly_tail", None)
+    if cached is not None:
+        order = [cached] + [t for t in order if t != cached]
+    for tail in order:
+        try:
+            polys, consumed = _parse_polys(pkg, data, end, tail)
+        except (EOFError, IndexError, ValueError, struct.error):
+            continue
+        if consumed == len(data):
+            pkg._fpoly_tail = tail
+            return polys
+    # Nothing fitted; take the version's word for it so the caller sees the
+    # real failure rather than a silent empty brush.
+    return _parse_polys(pkg, data, end, expected)[0]
+
+
+def _parse_polys(pkg, data, end, tail):
+    tail_bytes, tail_name = tail
     from ..package import Reader
 
     r = Reader(data, end)
@@ -92,7 +132,7 @@ def read_polys(pkg, export):
         tv = _vec(r)
         n_verts = r.i32()
         if not (0 <= n_verts <= 64):
-            raise ValueError("implausible vertex count %d in %s" % (n_verts, export.name))
+            raise ValueError("implausible vertex count %d" % n_verts)
         verts = [_vec(r) for _ in range(n_verts)]
         flags = r.u32()
         actor = r.i32()
@@ -102,13 +142,12 @@ def read_polys(pkg, export):
         brush_poly = r.i32()
         shadow_map_scale = r.f32()
         lighting_channels = r.u32()
-        if pkg.version >= UDK_FPOLY_EXTRAS:
-            # UDK adds FLightmassPrimitiveSettings -- nine fields, two-sided
-            # lighting through to the specular boost -- and the FName of the
-            # procedural-building ruleset variation. Neither has any meaning in
-            # UE2, so both are skipped; what matters is the stride, since
-            # reading a poly short walks into the middle of the next one.
-            r.p += LIGHTMASS_SETTINGS_SIZE
+        # Lightmass settings and a ruleset name, neither of which means
+        # anything in UE2. What matters is the stride: reading a poly short
+        # walks into the middle of the next one.
+        if tail_bytes:
+            r.p += tail_bytes
+        if tail_name:
             pkg.fname(r)
         polys.append(
             Poly(
@@ -127,7 +166,7 @@ def read_polys(pkg, export):
                 lighting_channels=lighting_channels,
             )
         )
-    return polys
+    return polys, r.p
 
 
 def read_bounds(pkg, model_export):
