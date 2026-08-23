@@ -193,7 +193,7 @@ def clean_package(out_dir, package):
 def _build_assets(p, package_path, texture_package, out_dir, max_size, with_meshes, scale,
                   skip_effects, with_terrain, layer_scale, no_skybox, with_sounds=True,
                   sound_gain=1.0, with_movers=True, max_keys=24, no_collision=(),
-                  deco_density=None, with_materials=True):
+                  deco_density=None, with_materials=True, with_sublevels=True):
     """Extract textures (and optionally static meshes) into one buildable package."""
     from convert.textures import TextureSet, collect_brush_materials, export_textures
     from ut3.resolve import PackageIndex
@@ -203,8 +203,28 @@ def _build_assets(p, package_path, texture_package, out_dir, max_size, with_mesh
         print("  cleared %d file(s) from the previous build" % stale)
 
     index = PackageIndex.for_map(package_path)
+
+    # A map may be spread over several packages: the persistent level names the
+    # ones it always has loaded, and UT2004 has no streaming, so the conversion
+    # is their union. See convert/sublevels.py. `levels` is what every actor
+    # converter below iterates; a map with no streaming levels gets a list of
+    # one and behaves exactly as before.
+    levels = [p]
+    if with_sublevels:
+        from convert.sublevels import open_levels
+
+        found, missing = open_levels(p, index)
+        if found:
+            print("  %d streaming sub-level(s) merged in: %s"
+                  % (len(found), ", ".join(name for name, _sub in found)))
+            levels += [sub for _name, sub in found]
+        if missing:
+            print("  %d streaming sub-level(s) NOT FOUND, so their part of the "
+                  "map is missing: %s" % (len(missing), ", ".join(missing)))
+
     texture_set = TextureSet(texture_package, materials=with_materials)
-    collect_brush_materials(p, index, texture_set)
+    for level in levels:
+        collect_brush_materials(level, index, texture_set)
 
     mesh_actors, mesh_stats, mesh_exec = [], None, []
     mover_actors, mover_stats = [], None
@@ -213,16 +233,21 @@ def _build_assets(p, package_path, texture_package, out_dir, max_size, with_mesh
 
         mesh_set = MeshSet(texture_package)
         moved = set()
-        if with_movers:
-            from convert.movers import convert_movers
+        for level in levels:
+            if with_movers:
+                from convert.movers import convert_movers
 
-            mover_actors, moved, mover_stats = convert_movers(
-                p, index, mesh_set, texture_set, scale=scale, max_keys=max_keys,
-                skip_effects=skip_effects
-            )
-        mesh_actors, mesh_stats = convert_actors(p, index, mesh_set, texture_set, scale=scale,
-                                                 skip_effects=skip_effects, skip=moved,
-                                                 no_collision=no_collision)
+                movers, level_moved, mover_stats = convert_movers(
+                    level, index, mesh_set, texture_set, scale=scale, max_keys=max_keys,
+                    skip_effects=skip_effects, stats=mover_stats
+                )
+                mover_actors += movers
+                moved |= level_moved
+            actors, mesh_stats = convert_actors(level, index, mesh_set, texture_set,
+                                                scale=scale, stats=mesh_stats,
+                                                skip_effects=skip_effects, skip=moved,
+                                                no_collision=no_collision)
+            mesh_actors += actors
         # Terrain foliage is scattered by the terrain rather than placed as
         # actors, so nothing above has referenced it. Register it here, while
         # the mesh export is still ahead of us -- see convert.terrain.
@@ -277,9 +302,12 @@ def _build_assets(p, package_path, texture_package, out_dir, max_size, with_mesh
                                     export_sounds)
 
         sound_set = SoundSet(texture_package)
-        sound_actors, sound_stats = convert_ambient_sounds(
-            p, index, sound_set, scale=scale, volume_gain=sound_gain
-        )
+        for level in levels:
+            sounds, sound_stats = convert_ambient_sounds(
+                level, index, sound_set, scale=scale, volume_gain=sound_gain,
+                stats=sound_stats
+            )
+            sound_actors += sounds
         sound_exec, sound_stats = export_sounds(sound_set, out_dir, index,
                                                 stats=sound_stats)
         sound_actors = drop_failed(sound_actors, sound_set, sound_stats)
@@ -301,7 +329,7 @@ def _build_assets(p, package_path, texture_package, out_dir, max_size, with_mesh
         apply_skins(mesh_actors + mover_actors, mesh_set, texture_set, mesh_stats)
     return (texture_set, written, uc_path, mesh_actors, mesh_stats,
             terrain_actors, terrain_stats, sky_info, sound_actors, sound_stats,
-            mover_actors, mover_stats)
+            mover_actors, mover_stats, levels)
 
 
 def cmd_t3d(args):
@@ -329,7 +357,7 @@ def cmd_t3d(args):
     if args.textures and not args.no_package:
         (texture_set, written, uc_path, mesh_actors, mesh_stats,
          terrain_actors, terrain_stats, sky_info,
-         sound_actors, sound_stats, mover_actors, mover_stats) = _build_assets(
+         sound_actors, sound_stats, mover_actors, mover_stats, levels) = _build_assets(
             p, args.package, texture_package, args.textures, args.max_texture_size,
             with_meshes=not args.no_meshes, scale=args.scale,
             skip_effects=not args.keep_effect_meshes,
@@ -339,6 +367,7 @@ def cmd_t3d(args):
             no_skybox=args.no_skybox, with_sounds=not args.no_sounds,
             sound_gain=args.sound_gain, with_movers=not args.no_movers,
             max_keys=args.mover_keys, with_materials=not args.no_materials,
+            with_sublevels=not args.no_sublevels,
         )
         print("  package: %s" % os.path.dirname(os.path.dirname(uc_path)))
         print("  textures: %d written, %d materials unresolved -> %s"
@@ -399,6 +428,20 @@ def cmd_t3d(args):
     # distance. "inline" keeps that model, at UT3's own size unless UE2's
     # 262144uu world forces it down; "skybox" uses UT2004's SkyZoneInfo idiom.
     world_bounds = stats.world_bounds
+    if mesh_actors:
+        from convert.skybox_move import play_area_for
+
+        world_bounds, from_meshes = play_area_for(world_bounds, mesh_actors)
+        if from_meshes:
+            size = tuple(world_bounds[1][i] - world_bounds[0][i] for i in range(3))
+            print("  the BSP is a shell around a streamed-in map, so the play area "
+                  "is taken from the %d placed mesh(es): %.0f x %.0f x %.0f uu"
+                  % (len(mesh_actors), size[0], size[1], size[2]))
+    # The map's own extent, before the expansions below (movers, an inline dome,
+    # kept backdrop) grow `world_bounds`. Everything that asks "how big is this
+    # map" wants this. It was stats.world_bounds everywhere until a map turned
+    # up whose BSP is not the map -- see play_area_for.
+    base_bounds = world_bounds
     inline_dome = None
     dome_clamped = False
     world_margin = args.world_margin + stats.max_brush_radius
@@ -509,7 +552,7 @@ def cmd_t3d(args):
     # builder brush (UnEdFact.cpp:647), so give it one to eat.
     t3d.add(make_builder_brush())
     world = None
-    if not args.no_world_brush and stats.world_bounds:
+    if not args.no_world_brush and base_bounds:
         # UT2004 is subtractive, UT3 is additive: carve out the space the UT3
         # geometry occupies before adding it back, or it stays buried in rock.
         margin = world_margin
@@ -530,9 +573,13 @@ def cmd_t3d(args):
     if not args.no_lights:
         from convert.lights import convert_lights
 
-        lights, light_stats = convert_lights(p, scale=args.scale, gain=args.light_gain,
-                                            radius_scale=args.light_radius_scale,
-                                            ambient_gain=args.ambient_gain)
+        lights = []
+        for level in levels:
+            level_lights, light_stats = convert_lights(
+                level, scale=args.scale, gain=args.light_gain,
+                radius_scale=args.light_radius_scale,
+                ambient_gain=args.ambient_gain, stats=light_stats)
+            lights += level_lights
         for light in lights:
             t3d.add(light)
 
@@ -561,7 +608,11 @@ def cmd_t3d(args):
     if not args.no_player_starts:
         from convert.actors import convert_player_starts
 
-        starts, actor_stats = convert_player_starts(p, scale=args.scale)
+        starts = []
+        for level in levels:
+            level_starts, actor_stats = convert_player_starts(
+                level, scale=args.scale, stats=actor_stats)
+            starts += level_starts
         taken_names.update(a.name for a in starts)
         for actor in starts:
             t3d.add(actor)
@@ -673,7 +724,7 @@ def cmd_t3d(args):
         # it afterwards puts the room clear of the very meshes about to be moved
         # into it: on CTF-FacingWorlds that pushed the room to x=-335058, past
         # UE2's 262144 world limit, and the whole sky vanished.
-        wlo, whi = stats.world_bounds
+        wlo, whi = base_bounds
         # Outside the world *brush*, not merely the geometry bounds: only actors
         # the subtract box does not enclose are unrenderable.
         box = (tuple(v - margin for v in wlo), tuple(v + margin for v in whi))
@@ -702,7 +753,7 @@ def cmd_t3d(args):
                 for i, v in enumerate(float(x) for x in m.groups()):
                     lo[i] = min(lo[i], v)
                     hi[i] = max(hi[i], v)
-        sky_actors = make_skybox(stats.world_bounds, texture_package, sky_mesh,
+        sky_actors = make_skybox(base_bounds, texture_package, sky_mesh,
                                  sky_radius or 1.0, clear_of=(tuple(lo), tuple(hi)),
                                  ambient=light_stats.ambient if light_stats else None,
                                  texture=texture_set.name_for(None) if texture_set else None)
@@ -735,9 +786,18 @@ def cmd_t3d(args):
                 note = ""
                 if len(merged) != len(moved):
                     note = " (%d merged as co-located)" % (len(moved) - len(merged))
+                # Printed as a ratio that reads correctly in both directions:
+                # the sky room usually shrinks the horizon (1:667 on BL-Dekk),
+                # but a map whose dome is smaller than the room's enlarges it,
+                # and "1:0" said nothing.
+                if world_scale and world_scale <= 1.0:
+                    ratio = "1:%.0f" % (1.0 / world_scale)
+                elif world_scale:
+                    ratio = "%.2f:1" % world_scale
+                else:
+                    ratio = "unscaled"
                 print("          %d distant backdrop mesh(es) moved into the skybox "
-                      "at 1:%.0f scale%s"
-                      % (len(merged), 1.0 / world_scale if world_scale else 0, note))
+                      "at %s scale%s" % (len(merged), ratio, note))
             # Place the dome where UT3 had it relative to the map, same scale.
             if dome_actor is not None:
                 dome_loc = parse_location(dome_actor)
@@ -773,7 +833,7 @@ def cmd_t3d(args):
         from convert.levelinfo import radar_range
         from convert.minimap import insert_exec, render, write_minimap
 
-        reach = radar_range(stats.world_bounds)
+        reach = radar_range(base_bounds)
         image = render(terrain_stats.rendered, reach, args.minimap_size)
         if image is not None:
             package_dir = os.path.dirname(os.path.dirname(uc_path))
@@ -785,19 +845,19 @@ def cmd_t3d(args):
                       % (reach, args.minimap_size, args.minimap_size))
             else:
                 radar_image = None
-    t3d.add(make_level_info(precache, bounds=stats.world_bounds,
+    t3d.add(make_level_info(precache, bounds=base_bounds,
                             radar_image=radar_image))
 
     # Every map gets a ZoneInfo, not just terrain ones. A converted map has none
     # of its own, so its zone is the LevelInfo and every level-wide setting --
     # ambient light, KillZ -- would have to be applied there by hand.
     zone = None
-    if not args.no_zone_info and stats.world_bounds:
+    if not args.no_zone_info and base_bounds:
         from convert.terrain import make_zone_info
         from ut3.objects.level import kill_z
 
         level_kill_z = kill_z(p)
-        zone = make_zone_info(stats.world_bounds, args.world_margin,
+        zone = make_zone_info(base_bounds, args.world_margin,
                               light_stats.ambient if light_stats else None,
                               terrain=bool(terrain_actors),
                               kill_z=(level_kill_z * args.scale
@@ -1040,6 +1100,10 @@ def build_parser():
     sp.add_argument("--surface-scale", type=float, default=1.0,
                     help="extra multiplier on BSP surface UVs; 1.0 reproduces UT3's "
                          "own tiling (the real conversion is UE3_BSP_UV_SCALE)")
+    sp.add_argument("--no-sublevels", action="store_true",
+                    help="do not merge the streaming sub-levels the persistent level "
+                         "always loads; an Angels Fall First map is nearly empty "
+                         "without them, since its content is streamed in")
     sp.add_argument("--no-lights", action="store_true", help="omit converted lights")
     sp.add_argument("--no-player-starts", action="store_true", help="omit PlayerStarts")
     sp.add_argument("--no-onslaught", action="store_true",

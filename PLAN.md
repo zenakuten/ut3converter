@@ -1641,6 +1641,51 @@ It checks two things that doing it by hand does not:
 The six TOXIKK maps are packaged: Dekk, Cube, Foundation, Artifact, Citadel and
 Ganesha -- 24 files, maps packing to 5-20% and texture packages to 28-46%.
 
+**Phase 18 -- a fourth UE3 game, and maps that arrive in pieces.** Angels Fall
+First (UDK 872, LZO). The reader needed nothing: the tag-dialect probe from
+Phase 17 measured it as UDK-style on its own, which is the first time a new
+build has cost no format work at all.
+
+What it needed was *sub-levels*. An AFF map is a nearly empty persistent level
+that streams the rest in. AFF-Errah.udk holds 12 mesh actors and 9 lights in a
+world 48,000 x 85,000 uu across; the map is three packages beside it, named
+only from `WorldInfo.StreamingLevels`:
+
+    loc-errah-terrain      3,506 mesh actors, 50 lights
+    loc-errah-camplewis    5,491 mesh actors, 132 lights
+    brf-generic-assets     20 InterpActors
+
+`convert/sublevels.py` reads those names and opens each package; ut3conv.py
+runs the actor converters over the list instead of over one package. Nothing
+merges *packages* -- each sub-level is converted as itself into the shared mesh
+and texture sets, so object references stay inside the package that made them,
+which is the only way they resolve. Only `LevelStreamingAlwaysLoaded` is taken:
+`LevelStreamingAuto` is conditional, and AFF-Errah's four are briefing rooms
+that would land on top of the map. `--no-sublevels` turns it off.
+
+*The play area is not always the BSP.* Every map until now had brushes covering
+the space it is played in, so the world bounds came from them. AFF does not:
+measured against six brushes and 42 polygons, the entire streamed-in level read
+as distant backdrop. 8,242 of 8,945 actors were being shrunk into the skybox
+and 5,300 more dropped for falling outside a world brush sized to the shell.
+
+`play_area_for` now takes the bounds from the placed meshes when the BSP is
+much smaller than they are, trimming 2% off each axis so the horizon scenery --
+the thing the bound exists to identify -- does not define it. That brought the
+move down to 437 and the drops to 413. Seven call sites were reading
+`stats.world_bounds` (the brushes) where they meant "how big is this map"; they
+read the corrected bounds now. Verified no change on DM-Deck, BL-Dekk or
+MP_Courtyard, none of which trigger it.
+
+    AFF-Errah   750 static meshes, 8,945 actors placing 3,761,216 triangles,
+                191 lights, 12 player starts, 177 textures
+
+*Known and not fixed.* AFF's sky dome is smaller than the room's, so the
+backdrop move *enlarges* rather than shrinks (the ratio print said "1:0" until
+it was taught to read both ways). 412 of the 437 moved meshes then fall outside
+UE2's world and are dropped. The map is unaffected -- these are horizon props
+-- but a map that leans on its backdrop would notice.
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes

@@ -78,6 +78,15 @@ if UDK_ENGINE is None:
 if os.path.isdir(UDK_ENGINE) and "UT3CONV_EXTRA_CONTENT" not in os.environ:
     os.environ["UT3CONV_EXTRA_CONTENT"] = UDK_ENGINE
 
+# Angels Fall First, a fourth UE3 game (UDK 872, LZO). Its maps are persistent
+# levels that stream their content in from CookedPC/Submaps, which the
+# converter merges -- see convert/sublevels.py. Only CookedPC/Maps is scanned,
+# so a sub-level is never mistaken for a map of its own.
+AFF_ROOT = os.environ.get("UT3CONV_AFF_ROOT")
+if AFF_ROOT is None:
+    AFF_ROOT = os.path.expanduser(
+        "~/.steam/steam/steamapps/common/Angels Fall First/AFFGame/CookedPC/Maps")
+
 # Gears of War Reloaded, a third UE3 dialect (version 835, licensee 76, LZ4).
 # Its maps are cooked, so unlike UDK they carry their assets and need no
 # separate content root.
@@ -88,7 +97,8 @@ if GEARS_ROOT is None:
         "Maps/MP_Maps")
 
 # Not maps: the front end, the intro cinematic and the tutorials.
-SKIP_PREFIXES = ("UTFrontEnd", "EnvyEntry", "UTM-", "UTCin",
+SKIP_PREFIXES = ("AFFEntry", "AFFFrontEndMap",
+                 "UTFrontEnd", "EnvyEntry", "UTM-", "UTCin",
                  # TOXIKK's front end and the UDK template map.
                  "CRZMainMenu", "ToxikkEntry", "ExampleEntry", "BL-WorkshopMap")
 
@@ -127,7 +137,11 @@ GEARS_SUBLEVEL_SUFFIXES = ("_Audio", "_Screenshots", "_VFX", "_Lighting",
 # both land on DM- -- which is not just a fallback: a CC map's team-assigned
 # PlayerStarts are exactly what UT2004's Team Deathmatch wants, and a map left
 # under an unknown prefix appears in no gametype's list at all.
-PREFIX_MAP = {"WAR-": "ONS-", "BL-": "DM-", "CC-": "DM-", "MP_": "DM-"}
+# AFF- is Angels Fall First's own prefix and means nothing to UT2004 either.
+# Its maps are large team-objective levels; nothing converts the objectives, so
+# they land on DM- like TOXIKK's CC maps and keep their team-assigned starts.
+PREFIX_MAP = {"WAR-": "ONS-", "BL-": "DM-", "CC-": "DM-", "MP_": "DM-",
+              "AFF-": "DM-"}
 
 # Where a converted name would land on a map that already exists. Only Torlan
 # does: UT2004 ships its own ONS-Torlan, and both would claim the same file.
@@ -205,6 +219,8 @@ def discover(variants=False):
         sources.append((UDK_ROOT, "*.udk"))
     if GEARS_ROOT:
         sources.append((GEARS_ROOT, "*.war"))
+    if AFF_ROOT:
+        sources.append((AFF_ROOT, "*.udk"))
     paths = []
     for root, pattern in sources:
         if root and os.path.isdir(root):

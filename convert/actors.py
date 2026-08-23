@@ -31,6 +31,9 @@ PLAYER_START_CLASSES = {
     # both convert to a plain PlayerStart and keep whatever team they carry.
     "WarTeamPlayerStart": "PlayerStart",
     "WarTeamPlayerStart_Wingman": "PlayerStart",
+    # Angels Fall First. Its maps are team games, so these carry a team the
+    # same way UTTeamPlayerStart does.
+    "AFFPlayerStart": "PlayerStart",
 }
 
 

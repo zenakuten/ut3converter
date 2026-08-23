@@ -153,3 +153,56 @@ def drop_distant_effects(actors, play_area, far_plane):
                 continue
         kept.append(actor)
     return kept, dropped
+
+
+def actor_bulk_bounds(actors, trim=0.02):
+    """Where the bulk of `actors` are, ignoring the furthest few per axis.
+
+    A mesh-based map's extent is its meshes, but taking their outright min and
+    max would swallow the backdrop -- which is the thing this bound exists to
+    identify. Trimming a couple of percent off each end drops the horizon
+    scenery while keeping the level, because a backdrop is a handful of very
+    distant actors and the map is thousands of near ones.
+    """
+    locations = [loc for loc in (parse_location(a) for a in actors) if loc]
+    if len(locations) < 8:
+        return None
+    lo, hi = [], []
+    for axis in range(3):
+        values = sorted(loc[axis] for loc in locations)
+        cut = int(len(values) * trim)
+        lo.append(values[cut])
+        hi.append(values[len(values) - 1 - cut])
+    return tuple(lo), tuple(hi)
+
+
+def _diagonal(bounds):
+    return sum((bounds[1][i] - bounds[0][i]) ** 2 for i in range(3)) ** 0.5
+
+
+def play_area_for(world_bounds, mesh_actors, ratio=0.5):
+    """The play area, taken from the meshes when the BSP plainly is not it.
+
+    Every map so far has had BSP covering the space it is played in, so the
+    world bounds came from the brushes. An Angels Fall First map does not: the
+    persistent level is a shell holding six brushes and 42 polygons, and the
+    map -- 8,945 mesh actors over 48,000 x 85,000 uu -- is streamed in from
+    sub-levels. Measured against those six brushes the whole level reads as
+    distant backdrop, and 8,242 actors were being shrunk into the skybox with
+    5,300 more dropped for falling outside a world brush sized to the shell.
+
+    So the brushes are used when they describe something comparable to where
+    the meshes are, and the meshes are used when they do not. Returns
+    (bounds, taken_from_meshes).
+    """
+    bulk = actor_bulk_bounds(mesh_actors) if mesh_actors else None
+    if bulk is None:
+        return world_bounds, False
+    if world_bounds is None:
+        return bulk, True
+    if _diagonal(world_bounds) >= _diagonal(bulk) * ratio:
+        return world_bounds, False
+    # Union, so any BSP outside the meshes is still inside the world.
+    lo = tuple(min(world_bounds[0][i], bulk[0][i]) for i in range(3))
+    hi = tuple(max(world_bounds[1][i], bulk[1][i]) for i in range(3))
+    return (lo, hi), True
