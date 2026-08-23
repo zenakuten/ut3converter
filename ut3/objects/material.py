@@ -11,6 +11,15 @@ import re
 from ..props import Struct, read_object_properties
 
 DIFFUSE_INPUTS = ("DiffuseColor", "DiffusePower", "EmissiveColor", "BaseColor")
+
+# Where an effect keeps the texture it is actually drawn with. A UT3 light beam
+# or fog sheet puts a flat colour in EmissiveColor and the whole of its visible
+# shape in Opacity -- M_EV_Lightbeam_Master_01's emissive is one white
+# VectorParameter, while its cone lives on a TextureSampleParameter2D called
+# "FalloffTexture" six nodes down the opacity chain. Searched only after the
+# colour inputs have found nothing, so a material that states its diffuse the
+# ordinary way is untouched.
+OPACITY_INPUTS = ("Opacity", "OpacityMask")
 TEXTURE_EXPRESSIONS = (
     "MaterialExpressionTextureSample",
     "MaterialExpressionTextureSampleParameter2D",
@@ -226,7 +235,7 @@ def live_branch(pkg, index, export, props, params):
     return "A" if on else "B"
 
 
-def _collect(pkg, index, export, depth, seen, found, params=None):
+def _collect(pkg, index, export, depth, seen, found, params=None, follow=None):
     """Every texture sample reachable from `export`, in graph order.
 
     Reachable means through the branches this material actually compiles: see
@@ -238,12 +247,18 @@ def _collect(pkg, index, export, depth, seen, found, params=None):
     seen.add(export.index)
     owner, tex = _texture_of(pkg, index, export)
     if tex is not None:
-        found.append((owner, tex, export))
+        # The sample carries its own package. It is not `owner`: that is where
+        # the *texture* lives, and a cooked material routinely samples a texture
+        # from another package -- TOXIKK's holograms sample MF_T_TDXHolo_01_D
+        # out of UA_Decos_02 from a material in the map. Pairing the expression
+        # with the texture's package reads the wrong export at that index, and
+        # material_panner then asks a SeqAct_Interp for its Coordinates.
+        found.append((owner, tex, (pkg, export)))
         return
     props, start, _end = read_object_properties(pkg, export)
     if start is None:
         return
-    keys = FOLLOW_INPUTS
+    keys = follow or FOLLOW_INPUTS
     if pkg.class_name_of(export) == "MaterialExpressionStaticSwitchParameter":
         keys = (live_branch(pkg, index, export, props, params),)
     for key in keys:
@@ -256,7 +271,28 @@ def _collect(pkg, index, export, depth, seen, found, params=None):
             sub_owner, sub_export = index.resolve(pkg, ref)
             if sub_export is None:
                 continue
-            _collect(sub_owner, index, sub_export, depth - 1, seen, found, params)
+            _collect(sub_owner, index, sub_export, depth - 1, seen, found,
+                     params, follow)
+
+
+# What an opacity texture is called. "falloff" and "mask" are penalised in
+# score_texture_name as evidence that a texture is *not* the diffuse -- which is
+# right, and is also exactly what an opacity map is supposed to be. Applying the
+# diffuse rule to the opacity walk marks down the one texture that walk exists
+# to find.
+_OPACITY_EXEMPT = ("falloff", "mask")
+
+
+def score_opacity_name(name):
+    """Lower is better: how likely this name is the map an effect is shaped by."""
+    score = score_texture_name(name)
+    if score >= DISQUALIFIED:
+        return score
+    low = name.lower()
+    for token, penalty in _WORD_PENALTY:
+        if token in _OPACITY_EXEMPT and token in low:
+            score -= penalty
+    return score
 
 
 def _stem(name):
@@ -301,11 +337,12 @@ def names_the_texture(material_name, texture_name):
 
 
 def _walk(pkg, index, export, depth, seen, reject=None, material_name=None,
-          params=None):
+          params=None, follow=None, scorer=None):
     """The most diffuse-looking texture reachable from `export`.
 
-    Returns (owner, texture, sample_expression) so the caller can also ask the
-    sample which UV channel it reads.
+    Returns (owner, texture, sample) so the caller can also ask the sample which
+    UV channel it reads. `sample` is a (package, export) pair, since it need not
+    live in the same package as either the texture or the material.
 
     Taking the *first* texture the graph reaches is not good enough. A UE3
     diffuse chain routinely multiplies a reflection or detail term in before it
@@ -316,9 +353,10 @@ def _walk(pkg, index, export, depth, seen, reject=None, material_name=None,
     is collected instead and the best-named one wins.
     """
     found = []
-    _collect(pkg, index, export, depth, seen, found, params)
+    _collect(pkg, index, export, depth, seen, found, params, follow)
     if not found:
         return None, None, None
+    score = scorer or score_texture_name
     # What the material is named after wins outright, but only among the
     # candidates the caller has not rejected -- the pixel test comes first, so a
     # relief bake cannot claim the material's name. See names_the_texture.
@@ -327,8 +365,8 @@ def _walk(pkg, index, export, depth, seen, reject=None, material_name=None,
         for entry in usable or found:
             if names_the_texture(material_name, entry[1].name):
                 return entry
-    best = min(score_texture_name(entry[1].name) for entry in found)
-    tied = [e for e in found if score_texture_name(e[1].name) == best]
+    best = min(score(entry[1].name) for entry in found)
+    tied = [e for e in found if score(e[1].name) == best]
     # Names alone cannot separate a base colour from an overlay that is also
     # called _D: WAR-PowerSurge's cliffs multiply a tiling rock texture by a
     # per-mesh relief bake, and the bake is the one nearer the output. Where
@@ -701,7 +739,41 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None, params=None):
                                             reject, export.name, params)
         if found is not None:
             if sample is not None:
-                _LAST_SAMPLE[0] = (found_owner, sample)
+                _LAST_SAMPLE[0] = sample
+            return found_owner, found
+
+    # Still nothing: the colour path holds no texture, so the texture this
+    # material draws -- if it draws one -- is in its opacity. See OPACITY_INPUTS.
+    #
+    # This runs ahead of the _subobject_textures fallback below and is strictly
+    # better informed than it: both end up choosing among the textures the
+    # material actually samples, but the walk knows graph order and *which
+    # sample* it landed on, which the flat "every texture this material owns"
+    # scan cannot. That matters twice over. M_EV_Lightbeam_Master_01 samples two
+    # falloffs and multiplies them together; they score identically, so the scan
+    # picked whichever came first in the export table -- T_EV_LightBeam_Falloff_02,
+    # a round blob -- over the cone the beam is shaped by. And leaving
+    # _LAST_SAMPLE unset sends material_panner to the material at large, where it
+    # found the Panner on T_EV_DustPanner_01: a texture on the dead side of the
+    # UseTextureOverlay static switch, which UT3 does not draw at all. Every
+    # light beam in the map was scrolling to it.
+    #
+    # "Alpha" is followed here and not in the diffuse walk because that is where
+    # a depth fade hangs its input: the fog sheets reach their falloff only
+    # through MaterialExpressionDepthBiasedAlpha.Alpha.
+    for key in OPACITY_INPUTS:
+        ref_expr = _expression_ref(props.get(key))
+        if ref_expr is None or ref_expr.is_null:
+            continue
+        expr_owner, expr = index.resolve(owner, ref_expr)
+        if expr is None:
+            continue
+        found_owner, found, sample = _walk(
+            expr_owner, index, expr, depth, set(), reject, export.name, params,
+            follow=FOLLOW_INPUTS + ("Alpha",), scorer=score_opacity_name)
+        if found is not None:
+            if sample is not None:
+                _LAST_SAMPLE[0] = sample
             return found_owner, found
 
     # Fall back to whichever of the material's own textures looks most diffuse.
@@ -825,11 +897,18 @@ def material_panner(pkg, index, ref):
     underlay's Panner on the artwork and set the whole sign sliding.
 
     `resolve_diffuse` leaves the sample it landed on in `_LAST_SAMPLE`, but it
-    only lands on one when the graph walk reached a texture. Where the texture
+    only lands on one when a graph walk reached a texture. Where the texture
     came instead from the last-resort "every texture this material owns" scan
     there is no sample to ask, and the material's own Panner is the only
-    information there is -- which is right for the fog sheets and light beams,
-    whose colour path holds no texture at all.
+    information there is.
+
+    That fallback used to catch the fog sheets and the light beams as well,
+    since their colour path holds no texture at all. It gave them the wrong
+    answer: the Panner those materials own is wired to `T_EV_DustPanner_01`, on
+    the dead side of the `UseTextureOverlay` static switch, and the drawn
+    sample -- the FalloffTexture parameter the opacity walk now finds -- has
+    camera-relative arithmetic on its coordinates and does not pan at all. 341
+    materials across the map set were scrolling to a texture UT3 never draws.
     """
     from . import graph as G
     import math

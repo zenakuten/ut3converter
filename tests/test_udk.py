@@ -18,7 +18,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from convert.textures import TextureSet
 from ut2 import dxt
-from ut3.objects.material import declared_diffuse_channel, material_albedo
+from ut3.objects.material import (_LAST_SAMPLE, declared_diffuse_channel,
+                                  material_albedo, material_panner,
+                                  resolve_diffuse)
 from ut3.objects.staticmesh import read_static_mesh, validate
 from ut3.objects.texture import read_texture
 from ut3.resolve import PackageIndex
@@ -157,6 +159,33 @@ def main(content):
                "%d > %d > %d across one row" % (red[7], red[3], red[0]))
 
     print()
+    # A sample and the texture it reads are not in the same package as often as
+    # a cooked map makes it look. BL-Dekk's waterfalls are the case: the
+    # material reference is in the map, the TextureSample is in fo_Water.upk and
+    # the texture in a third package again. The sample used to be recorded
+    # against the *texture's* package, so material_panner read whatever export
+    # happened to sit at that index -- a SeqAct_Interp, in the hologram case --
+    # and every one of these materials came out still.
+    dekk = index.package("BL-Dekk")
+    if dekk is not None:
+        print("a sample read across package boundaries")
+        found = dekk.find("SF_M_Water_Fall_Dekk_INST")
+        if found:
+            ref = dekk.ref(found[0].index)
+            _LAST_SAMPLE[0] = None
+            _owner, tex = resolve_diffuse(dekk, index, ref)
+            sample = _LAST_SAMPLE[0]
+            check("the waterfall draws its tiling texture",
+                  tex.name if tex else None, "T_ASC_VisCP_SM_WaterFall01Tile_D")
+            check_that("and the sample is recorded against its own package",
+                       sample is not None
+                       and os.path.basename(sample[0].path) == "fo_Water.upk",
+                       os.path.basename(sample[0].path) if sample else "none")
+            panner = material_panner(dekk, index, ref)
+            check_that("so the waterfall still scrolls",
+                       panner is not None and abs(panner[1] - 0.0608) < 0.001,
+                       str(panner))
+
     if _failures:
         print("%d check(s) failed: %s" % (len(_failures), ", ".join(_failures)))
         return 1

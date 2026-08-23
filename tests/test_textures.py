@@ -570,27 +570,61 @@ def main(path):
     check("and is not built at all", len(refused.pending), 0)
     check_that("but is reported", len(refused.invisible) == 1)
 
+    # An effect keeps its texture in Opacity, not in any colour input. The
+    # light beams are the case: EmissiveColor is one white VectorParameter and
+    # the cone the beam is shaped by hangs six nodes down the opacity chain, on
+    # a TextureSampleParameter2D called "FalloffTexture". With only the colour
+    # inputs walked, the search fell through to the last-resort "every texture
+    # this material owns" scan; M_EV_Lightbeam_Master_01 owns two falloffs and
+    # multiplies them together, they score identically, and the scan took
+    # whichever came first in the export table -- T_EV_LightBeam_Falloff_02, a
+    # round blob, in place of the cone. 126 materials across the map set.
+    from ut3.objects.material import _LAST_SAMPLE, resolve_diffuse
+
+    def drawn(name):
+        found = p.find(name)
+        if not found:
+            return None, None
+        _LAST_SAMPLE[0] = None
+        _owner, tex = resolve_diffuse(p, index, p.ref(found[0].index))
+        sample = _LAST_SAMPLE[0]
+        cls = None
+        if sample is not None:
+            cls = sample[0].class_name_of(sample[1])
+        return (tex.name if tex is not None else None), cls
+
+    check("a beam is drawn with the texture its FalloffTexture parameter names",
+          drawn("M_EV_Lightbeam_Master_01_INST")[0], "T_EV_LightBeam_Falloff_01")
+    check("and the parameter's own sample is what answered",
+          drawn("M_EV_Lightbeam_Master_01_INST")[1],
+          "MaterialExpressionTextureSampleParameter2D")
+    # The fog sheets reach theirs only through DepthBiasedAlpha.Alpha, which is
+    # why the opacity walk follows "Alpha" where the diffuse walk does not.
+    check("a fog sheet reaches its falloff through the depth fade",
+          drawn("M_EV_FogSheet_Master_01_INST")[0], "T_EV_FogSheet_Falloff_01")
+    # Ordinary materials are untouched: the walk runs only after every colour
+    # input has come up empty.
+    check("a material that states its diffuse the usual way is unaffected",
+          drawn("M_HU_Deco_SM_CitySignStores")[0], "T_HU_Deco_SM_CitySignStores_D")
+
     # A Panner on the coordinates is one of the few nodes with an exact UE2
     # counterpart. UE2 states it as a rotator plus a rate, and the rate is the
-    # magnitude of UE3's (SpeedX, SpeedY).
-    panner = material_panner(p, index, p.ref(master[0].index))
+    # magnitude of UE3's (SpeedX, SpeedY). This map's holo-screen sign advert
+    # scrolls at (0, -0.2) and is the case where the drawn sample really does
+    # carry the Panner.
+    import math
+    ads = p.find("M_HU_Deco_BSP_CitySignAds_Static")
+    panner = ads and material_panner(p, index, p.ref(ads[0].index))
     check_that("a panner converts to a direction and a rate",
-               panner is not None and abs(panner[1] - 0.0335) < 0.001, str(panner))
+               panner is not None and abs(panner[1] - 0.2) < 0.001, str(panner))
     # And the direction is the angle, *unnegated*. The ASE writes `1.0 - v` and
     # the importer computes `1.0 - ST.Y` back (UnStaticMesh.cpp:1048), so the
     # flips cancel and a converted mesh carries UT3's own UVs; the BSP writer
     # never flips at all. Negating SpeedY for a flip that does not survive to
-    # the data reversed every panning material along V.
-    import math
-    speeds = {"M_EV_FogSheet_Master_01": (0.03, -0.015),
-              "M_EV_Lightbeam_Master_01": (0.01, 0.04)}
-    for name, (sx, sy) in speeds.items():
-        found = p.find(name)
-        if not found:
-            continue
-        got = material_panner(p, index, p.ref(found[0].index))
-        want = int(round(math.atan2(sy, sx) / (2 * math.pi) * 65536)) & 0xFFFF
-        check("%s pans the way UT3 states it" % name, got and got[0], want)
+    # the data reversed every panning material along V. A pure-V panner is the
+    # sharpest test of it: negating would put it at 16384 instead.
+    check("the sign pans the way UT3 states it", panner and panner[0],
+          int(round(math.atan2(-0.2, 0.0) / (2 * math.pi) * 65536)) & 0xFFFF)
     # A panner along U alone is the control: it has no V component to get
     # backwards, so it must be yaw 0 under either reading.
     check("a pure-U panner is yaw 0",
@@ -604,12 +638,17 @@ def main(path):
     sign = p.find("M_HU_Deco_SM_CitySignStores")
     check("a sample with no Panner of its own does not pan",
           sign and material_panner(p, index, p.ref(sign[0].index)), None)
-    # But where the texture came from the last-resort scan there is no sample
-    # to ask, and the material's own Panner is the only information there is.
-    # The fog sheets and light beams live here: no texture in the colour path.
+    # The fog sheets and light beams are the same rule reached the long way
+    # round. Their colour path holds no texture at all, so the drawn sample is
+    # the one the opacity walk lands on: the FalloffTexture parameter, whose
+    # coordinates are camera-relative arithmetic with no Panner in them. The
+    # Panner these materials do own is wired to T_EV_DustPanner_01, on the dead
+    # side of the UseTextureOverlay static switch -- a texture UT3 never draws.
+    # Reading the material at large instead had every beam and fog sheet in
+    # every map scrolling to it.
     sheet = p.find("M_EV_FogSheet_Master_01_INST")
-    check_that("a material with no drawn sample still uses its own Panner",
-               sheet and material_panner(p, index, p.ref(sheet[0].index)) is not None)
+    check("an effect does not inherit a Panner from a branch UT3 drops",
+          sheet and material_panner(p, index, p.ref(sheet[0].index)), None)
 
     print("generated UE2 materials (Phase 14)")
     from convert.shaders import FRAME_BUFFER_BLENDING
@@ -646,7 +685,10 @@ def main(path):
     kinds = set(kind for kind, _props in live.materials.definitions.values())
     check_that("a Shader for the unlit part", "Shader" in kinds, str(sorted(kinds)))
     check_that("a FinalBlend on the outside", "FinalBlend" in kinds)
-    check_that("a TexPanner, since both materials scroll", "TexPanner" in kinds)
+    check_that("a ColorModifier, since both carry a level or a tint",
+               "ColorModifier" in kinds)
+    check_that("and no TexPanner, since neither drawn sample scrolls",
+               "TexPanner" not in kinds, str(sorted(kinds)))
     blends = [dict(props).get("FrameBufferBlending")
               for kind, props in live.materials.definitions.values()
               if kind == "FinalBlend"]

@@ -1686,6 +1686,86 @@ it was taught to read both ways). 412 of the 437 moved meshes then fall outside
 UE2's world and are dropped. The map is unaffected -- these are horizon props
 -- but a map that leans on its backdrop would notice.
 
+**Phase 19 -- the texture an effect is actually drawn with.** Reported from
+DM-HeatRay: `StaticMeshActor_1473` uses a `MaterialInstanceConstant` over
+`M_EV_Lightbeam_Master_01`, which has a `FalloffTexture` parameter -- was it
+being honoured? It was not, and the reason was structural.
+
+`resolve_diffuse` walked `DIFFUSE_INPUTS` -- DiffuseColor, EmissiveColor and
+friends -- and then fell through to the last-resort "every texture this
+material owns" scan. But a UT3 light beam has *nothing* in its colour path:
+`M_EV_Lightbeam_Master_01`'s EmissiveColor is one white VectorParameter, and
+the whole visible shape of the beam is in **Opacity**, six nodes down, on a
+`TextureSampleParameter2D` named `FalloffTexture`. The material owns two
+falloffs and multiplies them together; both score 60 under
+`score_texture_name` (the "falloff" penalty, written against cubemaps), so the
+scan took whichever came first in the export table --
+`T_EV_LightBeam_Falloff_02`, a symmetric radial blob -- in place of
+`T_EV_LightBeam_Falloff_01`, the cone that fades along the beam's length.
+Rendered as ASCII the two are not close: one is a tapering shaft, the other is
+a ball.
+
+So `resolve_diffuse` now walks `OPACITY_INPUTS = ("Opacity", "OpacityMask")`
+after the colour inputs have come up empty and before the scan. This is not a
+new heuristic layered on top -- it is *strictly better informed* than the scan
+it precedes. Both end up choosing among the textures the material actually
+samples (`_subobject_textures` already narrows to the reachable set), but the
+walk also knows graph order and **which sample** it landed on. Two things
+follow from the sample:
+
+- `"Alpha"` is followed in this walk and not in the diffuse one, because that
+  is where a depth fade hangs its input: the fog sheets reach their falloff
+  only through `MaterialExpressionDepthBiasedAlpha.Alpha`.
+- `score_opacity_name` drops the "falloff" and "mask" penalties. Those exist as
+  evidence a texture is *not* a diffuse, which is right, and is also exactly
+  what an opacity map is meant to be.
+
+*The panner that came with it.* Knowing the sample also settles Phase 14g's
+rule for these materials, and it reverses what 14g concluded. The Panner a beam
+or fog sheet owns is wired to `T_EV_DustPanner_01`, on the dead side of the
+`UseTextureOverlay` static switch -- `read_static_parameters` reads that switch
+out of the native permutation and it is False in every instance in every stock
+map. The drawn sample's own coordinates are camera-relative arithmetic
+(`AppendVector` over a `ComponentMask`/`SquareRoot` chain) with no Panner in
+them at all. **341 materials were scrolling to a texture UT3 never draws.**
+
+*And a package-mismatch bug it exposed.* `_collect` recorded each sample as
+`(owner, texture, expression)` where `owner` is the *texture's* package -- fine
+while both live in the same file, wrong the moment a cooked material samples
+across a package boundary, which TOXIKK does constantly. `material_panner` then
+read whatever export sat at that index in the wrong package; for BL-Dekk's
+holograms it was asking a `SeqAct_Interp` for its Coordinates. The sample now
+carries its own package. That alone put the scroll back on **36 materials**:
+every waterfall in Dekk, Citadel, Twin_Peaks and Ganesha, DM-Gateway's six
+portals, Strident's circuitry, Deimos' jump gate, Coret's torch, and
+BL-Dekk's moving cars.
+
+*Measured over all 157 maps, old resolution against new:*
+
+    148 rows change texture   126 of them Falloff_02 -> Falloff_01 (beams)
+                              4 TOXIKK puddles: a snow normal -> SF_T_PuddleMask
+                              2 glass panes: a spec map -> the pane's own mask
+                              1 waterfall -> the texture its material is named for
+                              1 noisy fog sheet: the dust panner -> its falloff
+    341 rows lose a panner    beams, fog sheets, cloud sheets, falloff spheres,
+                              holograms -- every one traced to a sample that is
+                              not the one drawn
+     36 rows gain a panner    the cross-package fix, listed above
+      0 rows change to a different panner
+
+DM-HeatRay rebuilt: `StaticMeshActor_1473` now carries
+`FinalBlend'DMHeatRayTex.T_EV_LightBeam_Falloff_01_313dFB'`, over a
+ColorModifier at (26,26,26) -- the instance's `Opacity` scalar of 0.1, which
+was already being read -- over an unlit Shader. `Falloff_02` no longer appears
+in the package at all.
+
+*Still approximate.* UE3 multiplies the two falloffs together; UE2 draws one
+texture per stage here, so the cone is drawn without the blob softening its
+mouth. A `Combiner` at `CO_Multiply`, or baking the product into a third
+texture at conversion time, would close that -- the texture pipeline already
+does comparable work in `bake_self_alpha`. Not needed for the shape to read
+correctly, which was the reported problem.
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes
@@ -2157,8 +2237,10 @@ they say no**, and the fallback survives only for the case where there is no
 sample to ask: `resolve_diffuse` lands on one only when the graph walk reached
 a texture, and a fog sheet or a light beam has no texture in its colour path at
 all, so its texture comes from the last-resort "every texture this material
-owns" scan. That is where the fog and the beams live, and their material's own
-Panner remains the only information there is.
+owns" scan.
+
+(Phase 19 took the fog and the beams back out of that fallback. They were the
+one family it was still catching, and it was giving them the wrong answer.)
 
 Of 717 materials across four maps whose drawn sample is known, **679 now
 correctly do not pan** -- and the list of what had been sliding is stairs,
