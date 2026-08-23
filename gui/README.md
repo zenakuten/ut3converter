@@ -110,8 +110,8 @@ Four DLLs have to sit beside `ut3convgui.exe`, all from
 |---|---|
 | `SDL3.dll` | SDL itself |
 | `libssp-0.dll` | Arch builds that SDL3.dll with the stack protector, so it imports this. Miss it and the exe dies at load with `status c0000135` and no window |
-| `lzo2.dll` | UE3 compresses package chunks with LZO, and every stock UT3 map uses it. The scripts load this through ctypes, not the exe |
-| `lz4.dll` | The same for Gears of War Reloaded, which compresses with LZ4 |
+| `liblzo2-2.dll` | UE3 compresses package chunks with LZO, and every stock UT3 map uses it. The scripts load this through ctypes, not the exe |
+| `liblz4.dll` | The same for Gears of War Reloaded, which compresses with LZ4 |
 
 The last two are for the Python scripts rather than the interface, which is why
 `objdump -p ut3convgui.exe` does not list them. Linux users install `lzo` and
@@ -133,7 +133,8 @@ A release is self-contained: the binary sits beside the converter it drives, so
 ut3convgui-<platform>-v2/
     ut3convgui[.exe]     the interface
     SDL3.dll             Windows only, with libssp-0.dll beside it
-    lzo2.dll lz4.dll     Windows only: the package codecs, for the scripts
+    liblzo2-2.dll        Windows only: the LZO codec, for the scripts
+    liblz4.dll           Windows only: the LZ4 codec, for the scripts
     ut3conv.py           the converter
     batch.py             every map, one package per build
     convert/ ut3/ ut2/   the modules those two import

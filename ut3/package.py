@@ -79,7 +79,8 @@ def _load_codec(soname, names):
         "Install it (%s), or on Windows put %s beside ut3conv.py.\n"
         "Tried: %s"
         % (soname, _INSTALL_HINT.get(soname, "see your package manager"),
-           names[0], ", ".join(tried)))
+           " or ".join(n for n in names if n.endswith(".dll")),
+           ", ".join(tried)))
 
 
 def _lzo_decompress(src, out_len):
