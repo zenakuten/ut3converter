@@ -980,10 +980,1157 @@ plus a ruleset `FName` on every `FPoly`, an enum name in every `ByteProperty`
 tag, and a one-byte `BoolProperty`. `BL-Dekk.udk` converts to 149 brushes, 197
 volumes, 67 lights, 110 path nodes and 9 reverb volumes.
 
-Static meshes do not convert, and in a UDK map that is most of it: the references
-point into TOXIKK's own `.upk` content packages, and both `StaticMesh` and
-`Texture2D` are different binary formats at 868. Left as a proof that the reader
-generalises, not as a feature.
+Static meshes did not convert, and in a UDK map that is most of it, so this was
+left as a proof that the reader generalises rather than a feature. Phase 13b
+took it further.
+
+**Phase 13b — UDK assets. DONE (geometry and textures).**
+`ut3/objects/staticmesh.py`.
+
+TOXIKK ships the UDK its maps were built with
+(`TOXIKK/Binaries/Win64/UDK.exe`), which reopened this. Two things came out of
+it, and the useful one was not the editor.
+
+*What the editor is worth, measured.* `UDK.com` runs commandlets headlessly
+under system Wine, needing none of what the GUI needs, so `UnrealEd.BatchExport`
+is available. (The GUI editor runs too -- see "Running the UDK editor under
+Wine" below -- but nothing in this pipeline needs it.) It is not enough to build a pipeline
+on. `StaticMesh OBJ` exports geometry and UVs but writes no `usemtl` or `g`
+line, so a multi-element mesh arrives as one undifferentiated blob with its
+material assignment gone; `StaticMesh T3D` exports tagged properties only, no
+geometry; the FBX exporter faults and leaves 0-byte files; and `Texture2D BMP`
+and `TGA` report "Exported ... to <path>" for every texture and then write
+nothing at all, the UE3 texture exporters refusing compressed formats and
+UnrealEd deleting the failed output. DDS and PNG have no exporter registered.
+Its lasting use is as the oracle Section 1 describes: the OBJ export is what
+the native reader was checked against below.
+
+*Reading the packages natively, which is what actually worked.*
+
+- **Texture2D at 868 needed no change.** All 29 textures in `te_Lab.upk` read
+  with every mip present at full resolution, through the existing reader
+  including its inline-LZO-mip handling. The pixels were checked by writing
+  DDS and looking at it. The claim above that Texture2D is a different format
+  at 868 was simply wrong.
+- **StaticMesh at 868 needed four fixes**, each a localized insertion rather
+  than a new format, and all gated on the package version so the UT3 path is
+  untouched: a 24-byte box holding the kDOP tree's root bound between
+  `BodySetup` and the kDOP arrays -- Min and Max only, without the validity
+  byte a tagged `FBox` carries, which is why 24 and not 25; 16 bytes between
+  `Version` and `LODCount`;
+  a `TArray<FFragmentRange>` plus a trailing byte on every element, which
+  leaves every buffer after it **unaligned**; and a colour vertex buffer that
+  omits its array header entirely when the mesh has no vertex colours.
+- **The UV block starts at offset 8, not 12** -- UDK writes two packed normals
+  where UT3 writes three. This one does not fail, it lies: on a two-channel
+  mesh, reading at 12 returns the *lightmap* UVs instead of the diffuse ones.
+
+Verified against UDK's own OBJ export as ground truth. All four `te_Lab` meshes
+match exactly on vertex and triangle count (494/368, 444/380, 81/118, 52/34),
+UVs agree (U identical, V flipped, which is the OBJ exporter's convention) and
+so do positions (the OBJ writes X, Z, Y). Each element also resolves a real
+material reference, which the OBJ route cannot supply at all.
+
+On BL-Dekk that is **4,745 of 4,781 mesh placements parsed, none failed**, for
+1,990,658 triangles placed -- DM-Deck scale. The 36 that do not resolve name
+editor-only packages (`EditorMeshes`, `MapTemplates`, `EngineVolumetrics`).
+`tests/test_meshes.py` still passes on the UT3 maps, UV-set checks included.
+
+*A correction worth keeping, because it cost a detour.* Content `.upk` files
+were briefly thought to have a broken tagged-property layout, on the strength
+of 457 of 462 exports failing to parse. They do not: that was `read_properties`
+being called at offset 0 instead of `read_object_properties`, which probes for
+where the list starts. Through the real entry point 436 of 462 parse, the rest
+being `Package` exports that carry no property list.
+
+**Phase 13c — materials that name their own channels. DONE (resolution).**
+`ut3/objects/material.py`.
+
+Every `MaterialInstanceConstant` in `te_Lab` resolved to the same unrelated
+texture. The cause is not a parsing fault but a different way of authoring:
+**TOXIKK materials mostly ship no diffuse map at all.** They pack albedo,
+specular and gloss into one texture, name the parameter after its own channel
+layout -- `Mask 1 (R=Diffuse, G= Specular, B=Gloss)` -- and tint the result
+with a `Base Color` vector parameter. Decoding the red channel of one confirms
+it: `MF_T_Wall_01_M` is a clean greyscale wall panel, lines, bolts and grime.
+
+The scoring table was throwing exactly that texture away -- "mask", "spec" and
+"gloss" all count against it and the name ends `_M` -- so the search fell
+through to the parent and took whatever default it found. A parameter name that
+declares its own channels is far better evidence than any heuristic, so
+`declared_diffuse_channel` now settles the choice outright, ahead of both the
+scoring and the parent. `resolve_base_color` walks the instance chain outwards
+for the tint, leaf first, since the usual shape is a leaf that restates only
+the colour over a parent that holds the texture (`MF_M_Wall_01_Dark_INST` at
+0.146 grey over `MF_M_Wall_01_INST`). `material_albedo` returns the two
+together with the texture.
+
+Scope, measured rather than assumed: this is an asset-authoring style, not a
+map-wide one. Of BL-Dekk's 63 distinct materials **59 resolve to an ordinary
+diffuse map, 2 use the declared-mask style and 2 fail** -- it is the te_Lab set,
+used by other TOXIKK maps, that is mask-heavy. `tests/test_textures.py` and
+`tests/test_meshes.py` still pass on the UT3 maps.
+
+**Phase 13d — baking the tint. DONE.** `ut2/dxt.py`, `convert/textures.py`.
+
+What resolution yields -- texture, channel, tint -- has to become one ordinary
+UT2004 texture, so the channel is decoded and multiplied by the Base Color on
+the way out. Three parts:
+
+- `encode_dxt1_tinted` is the first thing here that writes colour blocks rather
+  than copying them, and it can be short because the hard part of DXT1 --
+  fitting a line through a cloud of colours -- is already given: every texel in
+  a block is one colour at a different brightness, so the line *is* the tint.
+  Endpoints are the block's darkest and brightest texel scaled by it, and a
+  texel takes whichever of the four ramp entries its brightness is nearest.
+  Hue survives exactly, give or take the five bits DXT1 stores blue in.
+- **The tint is part of a texture's identity, not a property of it.**
+  `TextureSet` keyed by texture alone, so one mask drawn at two tints collapsed
+  into one; it now keys on (texture, channel, tint). `MF_T_Wall_01_M` exports
+  twice on te_Lab, at 0.146 and 0.798 -- the same wall panel dark and light.
+  `convert/meshes.py` solved the same shape in Phase 5b by keying a mesh on its
+  material set.
+- A texture the material names as its own albedo channel is exempt from the
+  name-based refusal. These are called `..._M` *because* they are masks, and
+  `NOT_DIFFUSE` would throw away the one texture the material actually draws.
+
+Baking runs per mip level, ahead of the opacity bake, and hands it DXT1 -- which
+is what that pass already expects, so a masked cutout still composites on top.
+
+**Phase 13e — two faults a multi-package map exposes. DONE.**
+`convert/textures.py`, `convert/meshes.py`, `ut3/objects/material.py`.
+
+Reported as `StaticMeshActor_2116` wearing a brown texture, and "a lot of
+meshes have that wrong texture" -- 111 of BL-Dekk's 296 meshes were painted
+with `MF_T_Mud_01_D`. Two independent causes, neither of them UDK-specific:
+
+- **Cache keys held an index without the table it came from.** `TextureSet`
+  keyed materials by `(is_import, index)` and `MeshSet` by the same plus its
+  overrides. A `PackageIndex` only means something relative to the package
+  holding the table, so index -880 in one content package and -880 in another
+  are unrelated objects -- and the first material to claim an index answered
+  for every other package's. A cooked UT3 map resolves everything through its
+  own table and the collision cannot arise; a UDK map draws on dozens of
+  `.upk` files. `ObjRef` already carries its package, so the key is now
+  `(pkg.path, is_import, index)` and no call site had to change. The same edit
+  fixed a latent mismatch in `MeshSet.name_for`, which keyed on the raw
+  overrides tuple where `add` keyed on a stringified one, so any lookup with
+  overrides missed.
+- **A pixel heuristic was overruling a material's own statement.** The
+  relief-bake test refuses a near-white, desaturated `_D` as a per-mesh bake,
+  and its own docstring says it is only for candidates that names cannot
+  separate. It ran first regardless. TOXIKK's panels are bright desaturated
+  sci-fi metal: `T_HighTechPanels_D` measures 0.739 brightness at 0.008
+  saturation -- further into the bake region than WAR-PowerSurge's genuine bake
+  -- while the parameter holding it is called `DiffuseMap`. An override that
+  names the diffuse slot now settles it before the pixels are read.
+
+  The UT3 case it exists for is untouched *by construction*: WAR-Serenity's
+  `M_UN_Rock_SM_Cliffs01_MI_SideA_05` names `Normal`, `DetailNormal` and
+  `ShadeMap`, none of which is a diffuse slot, so it still falls through to the
+  pixel test and still lands on the tiling rock rather than the bake. Checked
+  against the map rather than assumed.
+
+Meshes wearing the mud texture: **111 -> 1**, and that one really is mud.
+
+**Phase 13f — a reference resolved against the wrong package. DONE.**
+`ut3/resolve.py`.
+
+Found converting BL-Foundation, which reported 327 actors with no mesh against
+BL-Dekk's 23. Two thirds were real:
+
+- **`PackageIndex.resolve` paired a ref's export with the caller's package.**
+  `if ref.is_export: return pkg, ref.export` -- and `ObjRef.export` correctly
+  reads `ref.pkg`, so the *export* was right and the *package* returned with it
+  was not. A reference does not have to come from the package passed in:
+  following an archetype chain reads properties out of whatever package defines
+  the archetype. Resolving a `UA_Lights_01` export index against BL-Foundation
+  handed back that map's export 463 -- an `ExponentialHeightFogComponent` where
+  a lamp mesh should have been, 48 actors' worth. `ref.pkg` is the authority
+  now, with `pkg` as a fallback. UT3 maps are unaffected: everything there
+  resolves through the one cooked map package, so the two were always equal.
+
+  That makes three bugs in this family, all invisible until a map drew on more
+  than one package: the cache keys and the override package in Phase 13e, and
+  this. The rule they all break is the same one -- **a PackageIndex means
+  nothing without the table it came from.**
+
+- **Content the game does not ship.** UDK's own `Engine/Content` --
+  `EditorMeshes`, `EngineVolumetrics`, `EngineMeshes` -- lives in the UDK
+  installation, and BL-Foundation places 118 `EditorMeshes.TexPropPlane`, 9
+  `EngineMeshes.Sphere` and 116 `EngineVolumetrics` light beams. Unpacking the
+  UDK zip somewhere is enough; installing it over the game stops TOXIKK
+  launching. `UT3CONV_EXTRA_CONTENT` (PATH-separated) adds trees to the index,
+  and `batch.py` fills it in from `~/TOXIKK_UDK/Engine/Content` when that
+  exists. The light beams and fog sheets then convert far enough to be
+  recognised as the unlit translucent effects they are and skipped on purpose,
+  rather than counted as missing.
+
+Actors with no mesh: **327 -> 39**, and those 39 name `UA_Buildings_B_01`,
+which ships in neither the game nor the UDK zip.
+
+**Phase 14i — static parameters, and the tint nobody was applying.** Two
+findings from one reported surface on BL-Dekk,
+`M_TechPanel_simple_FloorPanels_RUNTIME_MainHallLow_INST`, checked against what
+the UDK browser shows for it.
+
+*Static switch parameters are readable after all.* Phase 14e recorded as a
+limitation that these instances say `bHasStaticPermutationResource=True` and
+carry no `StaticParameters` tagged property, so every static branch was
+evaluated at the master's default. UE3 writes an `FStaticParameterSet` into the
+native data *after* the tagged properties, and it can be found: the switch
+array is `count` then `count` of
+
+    FName (8) | Value (4) | bOverride (4) | FGuid (16)
+
+with the component-mask array (stride 44) immediately after it, which is what
+makes locating it safe -- a run of bytes that merely looks like one array
+almost never has a second, differently shaped one right behind it. The layout
+is confirmed field by field against the browser: 33 switches and 4 masks on
+this instance, `bUseBoxCorrectedCubemap` and `bUseCubemapCorrection` the only
+two it overrides, `bUseDiffuseMap` and `bUseDetailSpecularMap` true but
+inherited, `bUseSnow` and `bUseDirt` false. All 50 values agree once the parent
+chain is walked.
+
+It changes no texture resolution on any of the three maps -- the masters'
+defaults happened to agree everywhere it mattered. Worth having anyway: the
+branches are now evaluated correctly rather than correctly by luck, and a
+static switch decides which half of a material UE3 compiles at all.
+
+*The tint was the real fault.* `resolve_base_color` matches "Base Color", which
+is the packed-mask idiom Phase 13c found. This material multiplies its diffuse
+map by a `DiffuseColor` parameter instead, and nothing was applying it. **14 of
+BL-Dekk's 31 material instances carry a non-white one**, and two are not
+subtle: its landing pools are (0.04, 0.073, 0.243), a deep blue drawn from a
+grey texture, and a corrugated floor is (0.154, 0.178, 0.204).
+
+`diffuse_tint` walks the instance chain leaf-first for a vector parameter named
+like a tint -- and requires it to be one the graph actually *reads*, since a
+chain of instances accumulates parameters later revisions stopped using.
+`reachable_parameters` shares the live-branch walk `_reachable_textures`
+already does for exactly that. The result becomes a `ColorModifier`, which is
+what Phase 14b built the machinery for.
+
+**The two colour paths must not both fire, and the data said so before the
+code did.** `constant_colour` answers a material whose colour input folds whole
+-- which needs no texture in it -- and `diffuse_tint` answers one that draws a
+texture and multiplies it. On DM-Deck *every* material with a tint also folds,
+because the fog sheets and light beams state their colour as the same `Color`
+parameter both routines would find; applying both would square it. So the tint
+is only consulted when the fold declines. Pure black is refused as well, for
+the reason 14h refuses it: it erases the surface, and a material that tints
+something black does it through a mask this cannot follow.
+
+BL-Dekk goes from 6 opaque materials with something to say to 67, and 31
+ColorModifiers. DM-Deck and DM-HeatRay are untouched, which is the check that
+matters.
+
+*And a third normal map the names miss.* With the tint pass exercising more
+materials, `_is_normal_map` refused `SF_T_ConcreteDetail_D_N` too -- another
+name ending `_D_N` rather than `_n`.
+
+**Phase 14j — a heightmap drawn as light.** Reported as `StaticMeshActor_4839`
+on BL-Dekk having "a rainbow colour", and read correctly as an effect layer
+rather than the diffuse. It was:
+
+    Shader T_HighTechPanels_D_f1d0SH
+        Diffuse              = T_HighTechPanels_D           (the panel, neutral grey)
+        SelfIllumination     = SF_T_GroundHeightmaps_Glow   <- a heightmap
+        SelfIlluminationMask = SF_T_GroundHeightmaps_Glow
+
+Phase 14f gave lit opaque materials a glow, and `resolve_emissive` will walk
+the EmissiveColor chain to whatever texture it reaches. For
+`M_HighTechPanel_EdenParticles_INST` that is a ground heightmap, and a
+heightmap blended over a wall as self-illumination is exactly the iridescent
+sheen Phase 7c refuses normal maps for.
+
+Two fixes, and it is worth noting they independently catch the same five
+materials -- which is the confirmation that neither is a guess:
+
+* **The material says so.** `bUseEmissive` is *False* on all five. Phase 14i is
+  what makes that readable, and it is a statement rather than a heuristic, so
+  it outranks the graph walk -- which reaches the texture through a path the
+  switch does not gate. `resolve_emissive` now returns nothing when a material
+  declares it does not glow.
+* **The texture says so too.** `_unusable_glow` already refused a featureless
+  image and an unbakeable format; it now also refuses one whose name
+  disqualifies it as colour, one that reads as a tangent-space normal by pixels,
+  and one whose name says "height". `score_texture_name` has no opinion on
+  heightmaps because a heightmap never turns up as a *diffuse* candidate -- as
+  a glow it does.
+
+BL-Dekk: 5 bad glows gone, and `SF_T_GroundHeightmaps` no longer reaches the
+package at all. DM-Deck and DM-HeatRay: 0 materials affected either way, which
+is the check that matters -- 40 and 78 glows respectively, none of them
+declaring bUseEmissive False and none resolving a non-colour map.
+
+**Phase 14k — a tint that turned walls translucent.** Reported as BL-Dekk's
+new materials looking right but "a lot of them have transparency", with layers
+popping past each other as the camera moved. Not an engine limitation: every
+`ColorModifier` this converter emits was doing it.
+
+`ColorModifier` defaults `AlphaBlend=True` and `RenderTwoSided=True`
+(Engine/ColorModifier.uc), and nothing was overriding them. The render
+interface ORs both into the pass, and `AlphaBlend` rewrites a surface still at
+ONE/ZERO into SRCALPHA/INVSRCALPHA (D3D9MaterialState.cpp:1735) -- so applying
+a *tint* to an opaque wall makes it alpha-blended. UE2 sorts translucent
+surfaces per actor, which is exactly the popping: two overlapping walls swap
+order as the camera moves.
+
+Phase 14i is what made this visible, by giving 67 of BL-Dekk's opaque materials
+a tint and therefore a ColorModifier. Both flags are now stated False on every
+one; where a surface really is blended or two-sided, the FinalBlend above it
+says so. The effects are unaffected either way -- `ApplyFinalBlend` runs first
+and leaves the blend at something other than ONE/ZERO, so the override could
+never fire there.
+
+28 ColorModifiers on BL-Dekk, 14 on DM-Deck, 2 on DM-HeatRay, all three
+rebuilt and every one now carrying `(AlphaBlend, RenderTwoSided) = (False,
+False)`.
+
+**Phase 14l — two colours chosen per pixel.** Reported as
+`StaticMeshActor_2410` wearing `M_HighTechPanel_Pipes_Red_INST`, "a fancy
+material", appearing in UT2004 as a flat texture. It was flat: the pipe was
+getting its red tint and nothing else.
+
+TOXIKK paints a panel with *two* colours picked per pixel by one channel of the
+diffuse map -- `DiffuseColor` for the body, `DiffuseColor2` for the trim,
+`DiffuseColorMaskChannel` naming the channel that chooses, `bUseDiffuseColor2`
+saying whether it applies at all. **32 of BL-Dekk's materials do this**, a
+third of the map, and none of DM-Deck's -- an asset-authoring style, like the
+packed masks of Phase 13c. Multiplying by `DiffuseColor` alone turns the pipe's
+pale trim red and loses it; on the floor panels it is starker, warm white
+against near-black.
+
+Reading the mask channel is Phase 14i's parser again: the
+StaticComponentMaskParameter array immediately after the switches, already
+parsed to confirm the switches were where they looked. The pipes select **A**
+(their DXT5 alpha is the mask) and the floor panels **G**.
+
+*Baked, not built.* UE2's `Combiner` can blend two materials by a mask, but its
+mask is an alpha channel and this one is arbitrary, and the pieces would come
+to five objects and three texture stages for one surface. Instead the result is
+computed per pixel -- `rgb * lerp(colour one, colour two, mask)`, in linear
+space with one conversion at the end -- and written as an ordinary texture. 12
+distinct (texture, colour pair) combinations across the map collapse to 11
+files, and because it lands in the mesh's own material through the ASE the
+actors need no `Skins` at all: `StaticMeshActor_2410` now carries none.
+
+That needed a general DXT1 encoder. `encode_dxt1_tinted` from Phase 13d can be
+four lines of maths because its block colours are collinear by construction --
+one hue at varying brightness. These are not: a block straddling the trim holds
+red and near-white at once, so `encode_dxt1_rgb` finds each block's line from
+its darkest and brightest texel. Alpha is deliberately dropped, which is right
+twice over: every material doing this is opaque, and on the pipes the alpha *is*
+the mask, so keeping it would leave the shape of the trim in a channel nothing
+reads.
+
+The pipes come out red-bodied at a mean of (155, 46, 9) with the trim intact,
+their blue siblings at (8, 72, 163). `diffuse_tint` stands down wherever a
+blend was baked, or the body colour would be applied twice. DM-Deck and
+DM-HeatRay: zero textures recoloured, and identical output.
+
+**Phase 14m — UDK ambient sound levels.** Reported as TOXIKK's ambient sounds
+being too loud against UT3's. They were, and not by a little: every one of
+BL-Dekk's 112 came out at `SoundVolume` 255 with a radius of 707, against a
+real 0.275 and 261 for the first of them.
+
+UDK's `AmbientSoundSimple` states its levels under names of its own, as plain
+floats, where UT3 states each as one `RawDistributionFloat`:
+
+    UT3 512   MinRadius / MaxRadius   VolumeModulation   PitchModulation
+    UDK 868   RadiusMin / RadiusMax   VolumeMin/Max      PitchMin/Max
+
+Reading only UT3's names meant every value fell back to its default -- volume
+1.0, hence 255 for all 112, and `sqrt(400*5000)/2` for the radius, hence 707
+for all of them too. Loud, and audible from nearly three times too far. The
+mean of a min/max pair is the same reading `distribution_value` already takes
+of a uniform distribution, so both paths agree about what a range means.
+
+*And the slots scale it again.* Each `SoundSlot` carries a `VolumeScale`, a
+`PitchScale` and a `Weight` giving its share of the random draw, multiplying
+whatever the actor states. Only 9 of BL-Dekk's 112 are not 1.0, so it moves the
+median not at all -- but the one that made this visible goes from 0.55 to
+0.275, which is the difference between wrong and right for that sound.
+
+    volume min/median/max        radius median
+    DM-Deck        51/115/217        150      (unchanged)
+    DM-HeatRay    122/166/255        150      (unchanged)
+    BL-Dekk        64/210/242         74      (was 255/255/255 at 707)
+    BL-Foundation  64/229/229         61      (was 255/255/255 at 707)
+
+The UT3 maps are untouched, which is the check that matters.
+
+*What is left is not a bug.* TOXIKK authors its ambients louder than UT3 does
+-- 0.825 is the commonest value in BL-Dekk against UT3's 0.45..0.65 -- and
+neither engine's master mix transfers. `--sound-gain` is the dial for that, and
+`batch.py`'s per-map `EXTRA_FLAGS` is where a standing value would go.
+
+**Phase 14n — a false property list beating the real one.** Reported as
+`StaticMeshActor_509` on BL-Foundation being too big or in the wrong place. It
+was in the wrong place: at the world origin, an 11,260-unit city block dropped
+on the middle of the map. Its real Location is (16258, 14805, 3408).
+
+An export's tagged property list starts after whatever its class serializes
+natively, so `read_object_properties` finds the offset by trying each one until
+a list parses cleanly to its None terminator. It swept **all aligned offsets
+first and the unaligned ones after**, on the stated grounds that UT3 always
+aligns. That order is the bug: a false positive later in the export beats the
+true start earlier in it. TOXIKK's StaticMeshActors carry a 26-byte native
+prefix, and `StaticMeshActor_509` also parses at 236 -- so the aligned 236 won,
+and with it went the Location, Rotation and DrawScale3D that live in the real
+list at 26.
+
+Earliest wins now, aligned or not. Measured across five maps:
+
+    DM-Deck        27557 exports,   0 change
+    DM-HeatRay     28400 exports,   0 change
+    BL-Dekk        18232 exports, 368 change   (363 recover a Location)
+    BL-Cube         1841 exports,  47 change   ( 46 recover a Location)
+    BL-Foundation  32434 exports, 505 change   (504 recover a Location)
+
+**The UT3 maps do not move at all**, which is the check that matters -- their
+lists really are aligned, so scanning from zero finds the same offset.
+
+A handful of exports read *fewer* properties afterwards, and every one is a
+correction rather than a loss. `CameraActor` is the example: the aligned scan
+landed at 108, inside the `CamOverridePostProcess` struct, and returned its
+`bOverride_*` flags as though they were the actor's own, ending at 766 of a
+906-byte export. The new scan starts at 26, returns
+`CamOverridePostProcess, DrawFrustum, MeshComp, Location, Tag`, and ends at 906
+-- exactly the export size.
+
+Every StaticMeshActor in all three TOXIKK maps now carries a Location: 2772 on
+BL-Foundation, 4732 on BL-Dekk, 191 on BL-Cube, none missing.
+
+**Phase 14o — BL-Artifact, and a mesh with no LOD stride.** The map converts
+whole: 0 brushes (it is built entirely from static meshes, 105 volumes aside),
+168 meshes, 1,738 actors placing 2.27M triangles, 84 lights, 89 backdrop meshes
+moved into the skybox at 1:224.
+
+One mesh would not read. `terrain_sheets_polySurface12` is 12MB and came back
+`None`, which cost the map a terrain sheet. UDK normally writes sixteen bytes
+between `Version` and `LODCount` -- every mesh in four other maps does, and
+Phase 13b added the skip for exactly that -- and this one writes none. Nothing
+in the class says which, and there is no version to key on: it is the same
+package as the meshes that do.
+
+So the LOD table is found rather than strided to. It announces itself far more
+strongly than any offset could: a small LOD count, followed by a whole LOD that
+parses into elements whose indices all address its own vertices. The expected
+position is still tried first, so nothing that already worked changes; the
+search starts back at the kDOP tree because the difference can be negative --
+here it is *minus* sixteen. `terrain_sheets_polySurface12` reads as 7,597
+vertices and 14,378 triangles, and its triangle count matching the kDOP
+collision count exactly is the confirmation that the offset is right.
+
+That is the fourth stride in this reader replaced by something self-validating,
+after the header GUID, the export ComponentMap and the FPoly tail. Same lesson
+each time: a stride learned from the packages to hand is a guess about the ones
+that are not.
+
+    DM-Deck        125 meshes, all read and valid   (unchanged)
+    DM-HeatRay     205 meshes, all read and valid   (unchanged)
+    BL-Artifact      7 meshes, all read and valid   (was 6, one unreadable)
+
+*Two actors legitimately have no Location*, which is worth recording because
+Phase 14n was the opposite case. `StaticMeshActor_834` and `_835` parse cleanly
+from 26 to exactly their export end with no Location in the list, and their
+meshes are authored in world space -- `terrain_sheets_polySurface16` spans
+(2717, 296, 558) to (3917, 1700, 772) rather than sitting around its own
+origin. Placing them at the origin is correct.
+
+*Worth watching in the editor:* 2.27M triangles is the heaviest map converted
+so far, and the map has no SkyLight, so it gets no ambient at all unless
+`--ambient` is given. `batch.py` has no flag for it yet.
+
+**Phase 14p — CC-Citadel, and TOXIKK's second prefix.** The largest map
+converted from any game so far: 412 brushes, 311 meshes, **5,735 actors placing
+3.0M triangles**, 1,297 lights, 299 ambient sounds, 32 player starts of which 16
+are team-assigned. 16,964 package references, none unresolved.
+
+*Its KillZ is positive, and that is correct.* `WorldInfo.KillZ` reads 6025 with
+a `StallZ` of 15300, where every other map converted so far is negative. It is
+not a misparse: the map is authored high in Z -- its PlayerStarts sit at
+10027..10603 and its path nodes at 6712..14251, so nothing playable is below the
+line. Maps get built up in the air in the editor and this is what that looks
+like. Worth writing down because a positive KillZ looks exactly like the kind of
+sign error that has bitten this converter before.
+
+*`CC-` now maps to `DM-`.* TOXIKK's prefixes are its game modes -- BL is
+Bloodlust, a deathmatch, and CC is Cell Capture, a team objective mode. Neither
+mode's objectives convert, and a map left under a prefix UT2004 does not know
+appears in no gametype's list at all, so both land on `DM-`. For CC that is more
+than a fallback: its team-assigned PlayerStarts are exactly what UT2004's Team
+Deathmatch wants. **Assault is the better target for CC maps** -- the mode
+matches, and `UT2k4Assault` is installed -- but it needs objectives that nothing
+currently converts, so it is left for later rather than half-done.
+
+*Ambient 32*, matching BL-Foundation: with 1,297 placed lights, more than any
+other converted map, most of its own lighting survives and it needs no more fill.
+
+**Phase 14q — BL-Ganesha, and three maps with no sky.** A jungle temple map:
+7 brushes (it is built from meshes), 133 meshes, 1,693 actors placing 1.5M
+triangles, and only 12 lights -- **nine of which the mapper set to zero
+brightness**, which is stated in the map and not a misreading. Three live lights
+and a Sunlight for a daylight map, everything else baked, so it takes
+`--ambient 96` like BL-Cube.
+
+*It had no sky at all, and neither did two others.* `SKY_NAME_HINTS` was
+`("_sky_", "skydome", "_dome", "skybox")`, which catches UT3's
+`S_UN_Sky_SM_SkyDome05` and TOXIKK's `sm_skybox` -- but three of TOXIKK's six
+maps use a **sphere**: `SM_SkySphere` on BL-Ganesha and BL-Cube, and
+`SM_SkySphere_4UVChannels` on BL-Foundation. None matched, so no SkyZoneInfo was
+built and the sphere stayed in the level as ordinary geometry: 4,096uu of mesh
+at DrawScale 40 is 163,840uu across inside a 72,835uu world, so most of it fell
+outside the void and drew nowhere, and what was inside sat past the far plane.
+
+The hint added is `"skysphere"`, not `"sky"`, and the difference matters.
+Measured across eight maps, plain `"sky"` changes nothing on any UT3 map -- but
+it also matches `SM_ShaneSky_01`, which BL-Artifact and CC-Citadel each place
+*alongside* the `sm_skybox` they already use successfully. `find_sky_meshes`
+returns the largest first, so ShaneSky's 106,516uu radius would take the dome
+away from a skybox that works today, and nothing in the data says which of the
+two the author meant. The narrow hint fixes the three maps that are broken and
+leaves the two that are not alone.
+
+All three rebuilt and now carry a SkyZoneInfo; DM-Deck and DM-HeatRay still pick
+`S_UN_Sky_SM_SkyDome03` and `S_UN_Sky_SM_Dome01` exactly as before.
+
+**Phase 15 — a third UE3 build: Gears of War Reloaded. READS, DOES NOT YET
+CONVERT.** `WarGame/CookedPC/Maps/MP_Maps/MP_Courtyard.war`, package version
+835, **licensee 76** -- the first licensee-modified build this reader has seen,
+against UT3's 512 and UDK's 868, both licensee 0.
+
+The format work is done and the package reads completely: 6,438 names, 1,041
+imports, **30,936 exports**, 262 Polys, 852 StaticMeshes, 1,165 Texture2Ds.
+Four things had to change, and three of them were version thresholds that had
+been guesses all along.
+
+* **LZ4.** Compression flags `0x20`, where stock UE3 has COMPRESS_BiasSpeed and
+  this reader knew only ZLIB and LZO. Everything around the codec -- the chunk
+  table, the block framing -- is unchanged, so the codec is the whole
+  difference. `liblz4` is already on the system and goes in through ctypes
+  exactly as `liblzo2` does.
+* **The header's extra offsets.** UDK carries four more offsets after
+  `depends_offset` and UT3 does not; the gate was `version >= 584`, a guess
+  from having only those two builds. 835 does **not** carry them, so the GUID
+  was read 16 bytes late, no chunk table was found, and `read_range` handed
+  back raw compressed bytes as if they were the name table. Replaced with a
+  probe: the first generation restates the export and name counts the header
+  has just given, which lines up only when the GUID starts where it is being
+  read from. The header checks itself, at any version and any licensee.
+* **The export ComponentMap.** UT3 keeps one, UDK does not, and the gate was
+  `version < 639` -- another guess. 835 *does* keep one, so the map's first
+  class default object had its component name (`ParticleSystemComponent0`)
+  read as a net-object count and the table fell apart 17 entries in. The table
+  has a known length, so it can check itself: exactly one reading consumes
+  `export_offset .. depends_offset` to the byte. On MP_Courtyard that is
+  2,271,328 bytes for 30,936 exports, and only the ComponentMap reading lands
+  on it.
+* **The FPoly tail.** UT3 has nothing after LightingChannels, UDK has a
+  nine-field FLightmassPrimitiveSettings plus a ruleset FName, and 835 has a
+  *seven*-field version and no name -- 28 bytes. A threshold cannot separate
+  three shapes when the odd one out is in the middle, so each candidate is
+  tried and the one that consumes the export exactly wins. Verified on all
+  three builds: 503/503, 358/358 and 262/262 Polys exports read.
+
+The pattern is worth stating on its own: **every version threshold in this
+reader was a guess made from two data points, and the third build broke all
+three of them.** Each is now a probe against a length or a restated count the
+format already carries. That is strictly better than a threshold even for the
+builds already working, because it cannot be wrong about a build nobody has
+tried.
+
+*What the map converts to today, which is not much.* 492 polygons and 82
+volumes, 0 brushes (86 brush actors resolve no model), 0 lights, 0 player
+starts, no static meshes at all. The reason is that Gears cooks its actors
+differently:
+
+* **`StaticMeshCollectionActor`** -- 34 of them holding 3,381
+  StaticMeshComponents between them, which is where the whole map is.
+  `convert_actors` looks for StaticMeshActor and finds 16. The transforms are
+  readable: the actor's tagged properties end at 500 bytes and the remaining
+  6,400 are exactly 100 FMatrices, one per component, the first decoding to a
+  clean rotation and a translation of (-517.001, -2895.721, 491.111). What is
+  not yet cracked is where a *cooked* component's StaticMesh reference lives --
+  `read_object_properties` finds no property list on one at all.
+* **`StaticLightCollectionActor`** does the same for lights.
+* **`WarTeamPlayerStart`** and `WarTeamPlayerStart_Wingman` (46 between them)
+  are not in the PlayerStart table.
+
+So this is a working reader for a third UE3 dialect, not yet a converted map.
+
+**Phase 16 -- packaging a built map for a server.** `tools/package_maps.py`.
+Converting and building a map leaves it in two places the editor uses; shipping
+it needs four files in one folder -- the `.ut2`, its `.utx`, and a `.uz2` of
+each, which is the form a server sends to a joining client. The tool copies and
+compresses, taking a map by its *source* name the way `batch.py --match` does
+and asking `batch` for the converted and package names rather than restating
+the rules.
+
+It checks two things that doing it by hand does not:
+
+* **Staleness.** The `.ut2` is made by hand in UnrealEd, so nothing links it to
+  the `.t3d` it came from and a converter fix that was never re-imported is
+  invisible -- the map looks built and is a version behind. DM-Dekk was packaged
+  that way: its `.ut2` predated the skysphere fix, so its dome was still
+  `SM_skybox_up_high` at 1:224 rather than `SM_SkySphere` at 1:667. A `.ut2`
+  older than its `.t3d` is now refused, with `--force` to override.
+* **The compression ratio.** UCC reports one through a signed 32-bit percentage
+  that overflows on large files: BLGaneshaTex.utx packs to 43% of its size and
+  UCC calls it -28%. The ratio printed here is measured from the two files.
+
+The six TOXIKK maps are packaged: Dekk, Cube, Foundation, Artifact, Citadel and
+Ganesha -- 24 files, maps packing to 5-20% and texture packages to 28-46%.
+
+### Running the UDK editor under Wine
+
+Not needed to convert anything -- the pipeline is pure Python and never invokes
+UDK.exe -- but it is what lets a converted map be compared against the original,
+which is the editor pass Section 4 asks for. It does work. Four separate causes,
+each fixed in turn, on a copy of the Steam install with the UDK zip installed
+over it (installing over the *Steam* copy stops TOXIKK launching):
+
+1. **Managed assemblies are not on the probing path.** `UDK.exe.config` declares
+   `<probing privatePath="Editor/Release"/>`, and TOXIKK ships the editor's C#
+   assemblies flat in `Binaries/` instead. Copy the `Binaries/*.dll|exe` files
+   into `Binaries/Win64/Editor/Release/`.
+2. **UDK's installer replaces the script packages.** `cruzade.u` is compiled
+   against TOXIKK's `Engine.u`, and UDK's stock one cannot supply
+   `Engine.PrimitiveComponent:MaxDrawDistance`, so every CRZ class fails to
+   load, `LoadObject` returns null and the asset database dereferences it.
+   Restore `UDKGame/Script/*.u` from the Steam copy. (This is the same fault
+   that breaks the game itself when UDK is installed over it -- identical
+   address, reading 0x8C.) Only the script packages and stock UDK sample content
+   are overwritten; `Content/Toxikk` and `Content/Maps` are untouched.
+3. **Multi-threaded shader compilation crashes** in MSVCR100. Set
+   `bAllowMultiThreadedShaderCompile=False` under `[DevOptions.Shaders]` in
+   `UDKGame/Config/UDKEngine.ini` (and `Engine/Config/BaseEngine.ini`, so a
+   config regeneration keeps it).
+4. **Wine's `d3dx9_43` stubs `D3DXDisassembleShader`,** which UDK calls after
+   every shader compile (`D3D9ShaderCompiler.cpp:467`, error `FFFFFFFF`). The
+   genuine Microsoft DLL may already be in `system32` -- Wine loads its own
+   builtin regardless -- so what is needed is the override:
+   `wine reg add 'HKCU\Software\Wine\DllOverrides' /v d3dx9_43 /t REG_SZ /d native /f`.
+   `D3DCompiler_43.dll` (64-bit) is wanted too; both come out of
+   `Binaries/Redist/UE3Redist.exe`, whose `DXRedistCutdown/Jun2010_*_x64.cab`
+   files 7z will open.
+
+A handful of TOXIKK materials still fail to compile for PC-D3D-SM3 and draw as
+the default material in viewports.
+
+**Not attempted: material functions.** TOXIKK ships
+`MF_MaterialFunctions.upk` and `SF_MaterialFunctions.upk`. Material functions
+are a UDK feature with no UT3 equivalent, and the graph walk knows nothing
+about them.
+
+**Phase 14 — generated materials. DONE.**
+
+Everything above assumes a converted material is one flat `Texture`, because
+`convert/shaders.py` said a `ucc make` build cannot create a `Shader` or a
+`FinalBlend`. It can. The probe is `ShaderLab/` at the install root — not part
+of the pipeline; build it by adding `EditPackages=ShaderLab` and running
+`ucc make` from `System/`.
+
+A `Begin Object` block in a class's defaultproperties is constructed with
+`Outer = InParent` and `RF_Public`, and during `ImportPropertiesScripts`
+InParent is `Class->GetOuter()` — the class's own **package**, not the class
+default object (Editor/Src/UnEditor.cpp:824; `GEditor->Bootstrapping` is zero
+there, being raised only around `#exec`). So the object lands in the package
+root exactly like an `#exec TEXTURE IMPORT`ed Texture. `UObject::ResolveName`
+(Core/Src/UnObj.cpp:3648) walks `.` to arbitrary depth and even documents the
+`ClassName.SubObjectName` form, so nothing about the path was ever a barrier.
+UT2004 already ships objects made this way: `XGame.BulletSplash.SpriteEmitter29`
+and its siblings are `Begin Object` subobjects sitting in `XGame.u`.
+
+`editinlinenew` turned out to be a red herring — ImportProperties never reads
+the flag. `ColorModifier` and `OpacityModifier`, both `noteditinlinenew`, build
+exactly the same way.
+
+What the probe built, read back out of the saved `.u` with `tools/ut2props.py`,
+every value intact:
+
+    TexPanner  LabDustPan     Material=Texture'ShaderLab.BSP.LabDust'
+                              PanDirection=(Yaw=16384) PanRate=0.05
+    Shader     LabFenceShader Diffuse/Opacity=Texture'ShaderLab.BSP.LabFence'
+                              OutputBlending=OB_Masked TwoSided=True
+    FinalBlend LabDustFB      Material=TexPanner'ShaderLab.LabDustPan'
+                              FrameBufferBlending=FB_Brighten ZWrite=False
+
+— over textures imported by `#exec` into the same package, in a graph several
+levels deep. A *second* package built afterwards resolved
+`Shader'ShaderLab.LabFenceShader'` from the saved file into its own import
+table, which is the same shape a converted map's import table has.
+
+Two conditions, both learned the hard way:
+
+* **Something must reference the material or it is not saved.** SavePackage
+  writes only tagged objects. The first probe defined five materials,
+  referenced none of them, and produced a package containing none of them —
+  no error, no warning, just an empty package. `MaterialSet.emit` therefore
+  always writes a `GeneratedMaterials` array alongside the blocks.
+* **Order matters twice.** A package is resolvable by a later one only if it
+  appears earlier in EditPackages; and within one defaultproperties block,
+  ImportProperties reads line by line, so a block referring to an object
+  defined below it resolves to nothing. Registration order is dependency order
+  because a graph is built from the texture outwards.
+
+*What was built.* `ut2/materials.py` collects the definitions and emits the
+`Begin Object` blocks plus the keep-alive array into the generated `.uc`;
+`surface_style` and `build_material` in `convert/shaders.py` do the translation;
+`TextureSet` owns a `MaterialSet` and answers `material_for` (a bare path, for a
+t3d polygon) and `material_class_for` (`Class'Pkg.Name'`, for an actor
+property). `--no-materials` turns the whole thing off and reproduces the old
+output exactly, which is how each change below was checked.
+
+The mapping is Epic's, read out of `XEffectMat.utx` rather than invented:
+
+    UE3                          UE2
+    BLEND_Additive               FinalBlend FB_Brighten,    ZWrite=False
+    BLEND_Translucent            FinalBlend FB_Translucent, ZWrite=False
+    BLEND_Modulate               FinalBlend FB_Modulate,    ZWrite=False
+    BLEND_Masked                 (nothing — the texture's MASKED=1 and the
+                                  Phase 5e opacity bake already say it)
+    MLM_Unlit                    Shader with Diffuse = SelfIllumination
+    TwoSided                     TwoSided on whichever object is outermost
+
+`Link.LinkBeamBlueFB` is FB_Brighten with ZWrite off over a bare Texture;
+`goop.GoopFB` is FB_Translucent over `GoopShader`, which sets Diffuse and
+SelfIllumination to the same TexOscillator and nothing else — that is how UE2
+spells "unlit", and it is what the converter now emits.
+
+*Two consumers.* A BSP surface names its material directly in the t3d, which
+needs nothing new: `StaticLoadObject(UMaterial::StaticClass(), ...)` at
+`Editor/Src/UnEdFact.cpp:1600` takes any UMaterial. A static mesh cannot —
+UT2004 keeps materials on the mesh and the ASE is the only way to put them
+there, but an ASE binds `*BITMAP` while the package is being *parsed*, and a
+`Begin Object` material does not exist until defaultproperties are imported at
+the end of the build. So the mesh keeps its flat texture and the actor overrides
+it through `Skins(n)`, which UT2004 reads per material index
+(`AActor::GetSkin`, Engine/Src/UnActor.cpp:1275) — the mechanism Phase 6d
+already used for the goo.
+
+*Effect meshes are the payoff.* The objection at the top of `shaders.py` — that
+`M_EV_Lightbeam_Master_01` resolves to a texture off a disabled branch and draws
+as "a solid grey slab where UT3 draws a soft glow" — was an objection to the
+*blend mode*, not to the texture. Black contributes nothing under FB_Brighten,
+so the same texture drawn additively is a glow. `effect_is_drawable` keeps an
+effect actor whenever a non-opaque blend mode and a real texture are both there.
+Both conditions are load-bearing: a material that resolves nothing takes the
+grey placeholder, and a grey placeholder drawn additively is a bright haze over
+everything behind it.
+
+*DM-Deck, converted end to end and built.*
+
+    21 UT3 materials a flat texture cannot express (3 additive, 18 translucent,
+       all unlit) -> 17 Shader/FinalBlend objects in DMDeckTex.utx
+    201 effect actors that used to be dropped: 199 now drawn, 2 dropped
+    242 Skins references across 208 actors
+    0 BSP surfaces — DM-Deck's brushwork is genuinely all opaque
+
+The 84 that resolve `T_ASC_Base_BSP_Plaster_S` are the map's window glass
+(`S_HU_Deck_SM_FWindow_Glass` and its two broken variants), invisible before;
+107 are the light beams. BSP does exercise the path on other maps — CTF-Coret
+takes 4 of its 60 brush materials, DM-Sanctuary and CTF-Strident one each, a
+modulated `T_FX_RoilingFlame`.
+
+*One thing this broke, and the fix.* Drawing the effect meshes put actors in the
+list that had never been there, and one of DM-Deck's fog sheets sits 114,621uu
+from the play area. That answered "is there scenery too far to draw?" with yes
+and moved the map's entire distant city into the skybox — 62 meshes at 1:167,
+real level geometry among them. `drop_distant_effects`
+(`convert/skybox_move.py`) removes effect actors past the far plane before the
+question is asked: they cannot be drawn there whatever happens, and a map should
+not be restructured around geometry that contributes nothing. DM-Deck's backdrop
+stays in the level exactly as it did before.
+
+*Phase 14b — the whole graph, not just the blend mode.* Reported as
+`StaticMeshActor_4656` on DM-Deck looking wrong: one of the goo pit's fog
+sheets, drawn as a grey cloud where UT3 has green haze. The first pass carried
+a texture and a blend mode and threw away everything else the material said,
+and for UT3's volumetric effects everything else is most of it.
+
+`M_UN_Volumetrics_TexturedFogSheet_01_Goo` is a `MaterialInstanceConstant` over
+`M_EV_FogSheet_Master_01` that overrides six scalars and one vector, and the
+master states its EmissiveColor as `Color.rgb * Color.a` and nothing else.
+There is no texture in the colour path at all. So the entire appearance of a
+goo pit is one parameter — and resolving it as "a texture" lands on whatever
+turns up in the opacity chain, drawn white. Worse, every instance of a master
+resolves to the *same* texture, so DM-Deck's seven light beam variants (warm
+sunbeam, cool window, grey machine) were one white beam seven times.
+
+`ut3/objects/graph.py` folds an expression graph to a constant.
+`collect_parameters` walks the instance chain leaf-first for the overrides;
+`fold` evaluates Multiply/Add/Subtract/Divide/Abs/Min/Max/OneMinus/Clamp/Power/
+LinearInterpolate/Desaturation/ComponentMask over Constants, ScalarParameters,
+VectorParameters and StaticSwitchParameters. Anything else — a texture sample,
+a Fresnel, a CameraVector — returns None and the caller falls back to what it
+did before. It never guesses: it evaluates the graph exactly or declines.
+
+Three things it took to get right:
+
+* **A masked input pads opaque, not with zero.** `Color.rgb * Color.a` masks
+  its left side to RGB, and padding that with alpha 0 multiplied the alpha out
+  of the result.
+* **sRGB, not linear.** UE3 authors colour parameters linearly and gamma-
+  corrects on output; UE2 stores what it displays. 0.5 linear is 188, not 128,
+  and without the conversion every tint comes out muddy.
+* **An opacity chain does not fold, and that is the right answer.** UT3 drives
+  fog opacity from `PixelDepth` through a `DotProduct` and a `Divide` — a
+  per-pixel depth fade UE2 has nothing for. Standing those nodes at their
+  strongest and folding anyway was tried and gave 0.0002, because the depth
+  arithmetic is in world units and there is no sensible depth to supply. The
+  machinery was written and then removed: a plausible-looking wrong number is
+  worse than declining. The texture supplies the shape instead.
+
+*Two more things now convert.* A `Panner` node becomes a `TexPanner` — UE2
+states the same idea as a rotator and a rate, and `UTexPanner::GetMatrix`
+(UnMaterial.cpp:500) offsets UV by `PanRate * PanDirection.Vector()` per
+second, so the two speeds are a magnitude and an angle. The angle is negated
+because the converter flips V everywhere else. DM-Deck's waterfalls flow, its
+fog drifts and its city traffic moves. And a folded colour becomes a
+`ColorModifier`, which multiplies the material under it by a constant in both
+colour and alpha (`HandleTFactor_SP`, D3D9MaterialState.cpp:223).
+
+*The blend mapping was wrong, and the render code says so.* Read out of
+`D3D9MaterialState.cpp:299`: `FB_Translucent` is `ONE/INVSRCCOLOR` — UE1's
+brightness-keyed translucency, which ignores alpha entirely — while
+`FB_AlphaBlend` is `SRCALPHA/INVSRCALPHA`, which is what UE3's
+BLEND_Translucent actually means. The first pass used FB_Translucent for all of
+them. It is now FB_AlphaBlend, falling back to FB_Translucent only where the
+exported texture has no alpha channel to blend on, since alpha 1 everywhere
+would draw a fog sheet solid. That fallback is why `build_materials` runs at
+the *end* of `export_textures` rather than during `add_material`: only the
+export knows which textures ended up with alpha.
+
+*The shape that comes out*, all of it Epic's own idiom from `XEffectMat.utx`:
+
+    Texture
+      -> TexPanner        if the graph has a Panner
+      -> Shader           if MLM_Unlit; Diffuse = SelfIllumination, which is
+                          how goop.GoopShader spells "ignores lighting"
+      -> ColorModifier    if the colour folds to a constant
+      -> FinalBlend       FB_Brighten / FB_AlphaBlend / FB_Translucent
+
+Every one of those is a `UModifier` except the Shader, and the render interface
+accumulates the whole chain into one state (D3D9RenderInterface.h:395), so they
+compose. A `Shader` that will *not* be wrapped in a FinalBlend gets
+`OutputBlending=OB_Masked` where UT3 says BLEND_Masked: OB_Normal with no
+Opacity turns AlphaTest off outright (D3D9MaterialState.cpp:1521), which would
+draw a cutout solid.
+
+*DM-Deck, rebuilt.* 21 UT3 materials become 44 objects — 19 FinalBlend, 14
+ColorModifier, 8 Shader, 3 TexPanner — of which 14 carry a folded tint and 7
+pan. The seven light beam variants come out at seven different colours
+(147,124,82 for the sunbeams, 102,119,118 for the windows, 130,136,142 for the
+machine room) and seven different strengths; the goo is (174,228,91) at 65%.
+`StaticMeshActor_4656` wears `T_EV_FogSheet_CloudTex_02_c305FB_4`, that green
+over a panning cloud texture at FB_AlphaBlend; `StaticMeshActor_4611` wears
+`..._FB_7`, the window beam at alpha 13. All 3,407 material references in the
+t3d resolve against exports in the built package.
+
+*Phase 14c — the level, not just the colour.* Reported as
+`StaticMeshActor_4611`, a light beam wearing
+`M_UN_Volumetrics_Lightbeam_Cheap_02_Windows`. The colour was right by then;
+the strength was not. That material's opacity is
+
+    clamp(0.0025/Distance * PixelDepth) * FalloffA * FalloffB * ScalarParameter"Opacity"
+
+and the scalar is 0.05. Phase 14b established that an opacity chain does not
+fold, which is true of the *chain* — but the **level** it is scaled to almost
+always does, stated as one parameter multiplied in at the top. Dropping it drew
+every beam at full strength, twenty times what UT3 shows.
+
+`graph.constant_scale` walks down the multiply chain, folding whichever side of
+each `Multiply` is constant and following the side that is not, so what it
+returns is the exact product of the factors that genuinely fold. Three wrappers
+are transparent to it: a `StaticSwitchParameter` (picking the live branch is
+exact — the other is not compiled into the shader at all), a `DepthBiasedAlpha`
+(UE2 has no depth bias, so the alpha under it is all that survives) and a
+`Clamp` (pulling a factor out from under one is exact wherever the clamp is not
+biting, and these clamp to 0..1 around a value that reaches 1 at most). It never
+descends into a Multiply where neither side folds, so the depth term and the
+falloff textures are left alone as the shape.
+
+DM-Deck's beams come out at 0.035, 0.05, 0.10, 0.125, 0.15 and 0.25 — the range
+a mapper would tune by hand — its window glass at 0.8, the goo at 0.65 and the
+background flare at 0.5. Everything with no `Opacity` parameter reads 1.0.
+
+Where the level goes depends on the blend, and the render code decides it:
+`FB_AlphaBlend` and `FB_Brighten` are both driven by source alpha, so it becomes
+the `ColorModifier`'s alpha; `FB_Translucent` is `ONE/INVSRCCOLOR` and ignores
+alpha entirely, so there the level *is* the brightness and it scales the colour
+instead.
+
+**A material at zero opacity is not built at all.** DM-HeatRay's
+`M_EFX_Particles_Distortion01` states `Opacity = Constant 0`: it is pure screen
+distortion, and what UT3 shows through it is the scene behind. Recording it
+would have been worse than useless — `will_build` is what decides whether an
+effect mesh is drawn, so the actor would have been kept, given no Skins, and
+drawn wearing its flat texture solid.
+
+*Phase 14d — textures in a branch UT3 never compiles.* Reported as
+`StaticMeshActor_4656` still not right after 14c: a goo sheet drawn with a
+cloud texture where UT3 draws a soft falloff.
+
+`M_UN_Volumetrics_TexturedFogSheet_01_Goo` is named after an overlay it does
+not use. Its master gates that overlay behind a `UseTextureOverlay`
+**StaticSwitchParameter**, the default is off, and the instance overrides no
+static parameters at all. A static switch is not a runtime branch: UE3 compiles
+one side into the shader and discards the other, so a texture on the dead side
+is never sampled. `convert/shaders.py` has said exactly this since Phase 1 --
+"the texture a naive resolver lands on (`T_EV_DustPanner_01`) comes from a
+disabled `UseTextureOverlay` branch" -- and it was never acted on because the
+effect meshes were being dropped anyway. Phase 14 made them visible.
+
+Two places now follow only the live branch: `_collect`, which the diffuse walk
+uses, and `_subobject_textures`, which is the last resort and the one that
+mattered here -- a fog sheet has no texture in its colour path at all, so it
+always falls through to "every texture this material owns", where the cloud
+beat the falloff because `score_texture_name` penalises "falloff" by 60 as a
+rule aimed at cubemap falloffs.
+
+**Reachability needed its own traversal.** `_collect` follows a fixed list of
+inputs chosen for hunting a diffuse, and a fog sheet's only texture hangs off a
+`DepthBiasedAlpha.Alpha` -- not on the list, so the walk stopped one node short
+of everything that mattered and the reachable set came back empty. Widening the
+diffuse walk instead would change which texture every material in every map
+resolves to, in order to answer a question about reachability. So
+`_reachable_textures` follows *every* property that resolves to a
+MaterialExpression and answers only that.
+
+Measured across six maps, 32 of 1,381 materials change and every one is an
+effect material:
+
+    fog sheets                     cloud overlay -> T_EV_FogSheet_Falloff_01
+    every M_EV_Lightbeam_Master_01 T_EV_DustPanner_01 -> T_EV_LightBeam_Falloff_02
+    WAR-Torlan's distortion river  T_UN_Rock2_BSP_Rock08 -> T_Liquid_SM_NanoBlack_Mask_01
+
+None loses its texture. The river is the one worth noting for being nothing to
+do with fog: it was painted with a rock texture.
+
+*The bio goo substitution stays, and now there is a reason on file.* With
+materials buildable it was worth asking whether `EFFECT_SUBSTITUTES` still
+earns its place. For the goo *surface* it does. `M_HU_Deck_Goo_Translucent`
+computes its colour as
+
+    Constant3Vector(2.0, 4.0, 0.4) * GoldCube1.rgb        (a cubemap, by ReflectionVector)
+      + T_EV_DustPanner_01 * Constant3Vector(0.025, 0.025, 0.01)
+
+-- the green is a cubemap reflection tint. Cubemaps are refused as colour maps
+(Phase 7c) and this pipeline exports none, so what a generated material would
+draw is the fallback, `T_EV_DustPanner_01`, which measures mean 126 over a
+106..164 range: near-uniform grey. A flat grey slab where UT3 has moving green
+goo, against `XEffectMat.goop.GoopFB`, which is an actual animated goop.
+
+The split `sheet_is_horizontal` already draws turns out to be the right one and
+is unchanged: the flat, level *surface* sheets take the stock material, and the
+vertical haze around them converts with its own falloff and tint.
+
+*Phase 14e — DM-HeatRay, and a panner running backwards.* Reported as
+`StaticMeshActor_1276`, a light cone whose animated material scrolled the wrong
+way. It did. `material_panner` negated UE3's `SpeedY` on the grounds that the
+converter flips V — and it does not. `ut2/ase.py` writes `1.0 - v` and the ASE
+importer computes `1.0 - ST.Y` back (Editor/Src/UnStaticMesh.cpp:1048), so the
+two cancel and a converted mesh carries UT3's own UVs; the BSP surface writer
+never flips at all. Both engines also offset the *coordinates* by speed times
+time (`UTexPanner::GetMatrix`, Engine/Src/UnMaterial.cpp:500), so
+`PanRate * PanDirection.Vector()` is `(SpeedX, SpeedY)` with nothing negated.
+
+Every panning material along V was reversed; DM-Deck's waterfalls were running
+uphill. The control that makes it unambiguous is `M_UT_SM_movingcars`, whose
+panner is pure U: yaw 0 under either reading, and unchanged by the fix.
+
+*A second panner fault, found alongside it.* `material_panner` returned the
+first Panner anywhere in the graph. `M_EV_FogSheet_Master_01` carries two, one
+per texture sample, so a sheet could scroll at a speed belonging to a texture it
+was not drawing. `resolve_diffuse` already leaves the sample it landed on in
+`_LAST_SAMPLE`; that sample's own Coordinates chain is searched first now, and
+the material at large only as a fallback.
+
+*And two from building DM-HeatRay, before anyone looked at it.*
+
+* **A scalar nested one level inside the product was missed.**
+  `M_EV_Lightbeam_Master_01_INST` sets `Opacity` to 0.1, and `constant_scale`
+  returned 1.0 -- ten times too strong, the same fault as 14c and not caught by
+  it. The walk gave up when *neither* side of a `Multiply` folded, and this
+  master puts the scalar under a `DepthBiasedAlpha` one level down. Descending
+  both sides is correct for a product, but doing it naively brought back the
+  0.0002 problem: `M_UN_Volumetrics_Lightbeam_Cheap_02` clamps
+  `PixelDepth * 0.0025` *inside* its product, and that 0.0025 is a saturating
+  depth ramp rather than a level. So the walk has two phases -- the spine
+  (`_SPINE`: static switches, DepthBiasedAlpha, the outermost Clamp) is
+  followed down to the product, and inside the product nothing but `Multiply`
+  is descended. Checked against 640 non-opaque materials across six maps: only
+  two land under 0.02, `M_EFX_Particles_Distortion01` at 0.0 and `M_Invis_01`
+  at 0.01, both honest.
+* **No-op ColorModifiers.** A folded colour of pure white at full alpha
+  multiplies by one. UCC drops the property (it equals the class default) but
+  the object is still built and still costs a texture stage at render time,
+  and stages run out -- "No stages left for constant color modifier" is a real
+  failure path (D3D9MaterialState.cpp:1751). Skipped now.
+
+*A limitation worth stating.* These instances carry
+`bHasStaticPermutationResource=True` but no `StaticParameters` tagged property:
+UE3 keeps static-switch overrides in native data after the property list, which
+this reader did not read, so a switch's value came from the master's default.
+**Phase 14i lifted this** -- the set is now parsed out of the native data and
+checked against UDK's own browser.
+
+*Phase 14f — opaque materials that still say something.* Reported as
+`StaticMeshActor_876`, a city sign converting as two flat textures where UT3
+draws two materials. Both of its elements are **BLEND_Opaque**, and everything
+above only built for non-opaque surfaces, so neither was even considered.
+
+Two kinds of opaque material are expressible and were being thrown away:
+
+* **Unlit.** `M_HU_Deco_SM_CitySignStores` is MLM_Unlit with no diffuse at all
+  -- an animated LED panel that is pure emissive. A `Shader` whose Diffuse and
+  SelfIllumination are the same material is UE2's way of saying that.
+* **Lit, with a glow.** `M_HU_Deco_SM_CitySignsTexts` paints
+  `T_HU_Deco_SM_CitySign01b_D` and adds `T_HU_Deco_SM_CitySignsTexts_E` at
+  fifteen times brightness on top. UE2's Shader has exactly those two slots.
+
+The old code skipped both, on the stated grounds that "UT3 marks a great deal
+of ordinary geometry unlit ... and self-illuminating it all would flatten the
+lighting". Measured instead of asserted, that is wrong: of 487 opaque materials
+across four maps only **42 are unlit**, and every one is a city sign, an ad
+board, a holo screen or a sky. **128 more carry a separate emissive texture** --
+signs, street lights, lit windows.
+
+**The trap, and it is a total one.** `Shader.SelfIllumination` without a
+`SelfIlluminationMask` does not add a glow. It *replaces* the diffuse and
+unlits the whole surface:
+
+    if( InShader->SelfIllumination && !InShader->SelfIlluminationMask )
+        { InDiffuse = InShader->SelfIllumination; Unlit = 1; ... }
+        -- D3D9Drv/Src/D3D9MaterialState.cpp:972
+
+So the obvious `Shader{Diffuse=D, SelfIllumination=E}` would have drawn the
+sign as its `..._E` texture alone -- which measures mean 17 out of 255, nearly
+black. Far worse than the flat diffuse it replaced. With the mask set, the
+engine takes its alpha and blends the glow over the lit diffuse instead
+(D3D9MaterialState.cpp:1096).
+
+That alpha is what a UE3 emissive does not have: it is read as *colour*, and
+its brightness is the mask. So `bake_self_alpha` writes each glow texture's own
+Rec. 601 luma into its alpha, and the Shader names it as both SelfIllumination
+and SelfIlluminationMask. A glow is therefore a *separate copy* of the texture
+-- `glow` is part of `add_texture`'s key, because the same image drawn as an
+ordinary diffuse must not acquire an alpha channel.
+
+Half of UT3's emissives are DXT5, whose alpha is overwritten by this and whose
+colour half needed a decoder of its own -- a DXT5 block is eight bytes of alpha
+followed by a DXT1 colour block exactly, so `decode_dxt5_channel` is the same
+decode at an offset. Overwriting is the right call: the material never samples
+that alpha.
+
+`_unusable_glow` refuses two things, and refusing is what keeps a texture
+nothing will reference from being exported: an image with no variation at all
+(the engine's placeholder, `UN_Shaders.T_Diffuse`, is 32x32 at mean 128 with a
+spread of zero -- an unfilled slot, and drawn as a glow it washes the surface
+out), and any format whose luminance cannot be measured, which is by
+construction the same set `bake_self_alpha` cannot bake.
+
+DM-HeatRay: 25 Shaders (15 glowing, 10 unlit), 14 glow textures, 599 actors
+wearing a generated material against 22 before. `StaticMeshActor_876` gets both
+of its elements -- `Skins(0)` the lit sign glowing its text, `Skins(1)` the
+unlit panning store panel.
+
+*Phase 14g — a Panner animates its own sample and no other.* Reported
+immediately after 14f: the same sign now carried its materials but scrolled,
+and does not in UT3.
+
+`material_panner` searched the drawn sample's Coordinates first and fell back
+to the material at large. `M_HU_Deco_SM_CitySignStores` is exactly the shape
+that breaks: a scrolling LED underlay (`T_UN_Team_SM_LED_Base_Pan`, through a
+Rotator) with static artwork over it. The drawn sample is the artwork, whose
+Coordinates are a `BumpOffset` with no Panner at all -- so the fallback ran and
+put the underlay's Panner on the artwork.
+
+The rule is simply that a Panner belongs to the sample it is wired to. Where
+the drawn sample is known its Coordinates are the authority **including when
+they say no**, and the fallback survives only for the case where there is no
+sample to ask: `resolve_diffuse` lands on one only when the graph walk reached
+a texture, and a fog sheet or a light beam has no texture in its colour path at
+all, so its texture comes from the last-resort "every texture this material
+owns" scan. That is where the fog and the beams live, and their material's own
+Panner remains the only information there is.
+
+Of 717 materials across four maps whose drawn sample is known, **679 now
+correctly do not pan** -- and the list of what had been sliding is stairs,
+rubble, ferns, grass, hair and concrete. 14f is what would have made that
+visible, by giving those materials a Shader to carry the panner on. The
+waterfalls, the moving cars and the light cones keep theirs, all three having
+their Panner on the sample actually drawn.
+
+DM-HeatRay's TexPanners fall from 11 to 3, DM-Deck's from 8 to 3.
+
+*Phase 14h — BL-Dekk, and the same machinery on UDK.* The material work above
+was written against UT3's cooked packages; TOXIKK's BL-Dekk exercises it on UDK
+(package version 868) where materials are mostly `MaterialInstanceConstant`
+chains over shared masters. It converts: 38 UT3 materials become 29 objects --
+12 Shaders, 10 FinalBlends, 6 TexPanners, a ColorModifier -- with 328 actors
+wearing one and all 8,050 package references resolving. Four faults came out of
+it, three of them general.
+
+* **A normal map the name rules miss.** `SF_T_TilingBubbles_N_H` ends `_N_H`
+  rather than `_n`, scores a clean 0, and painted BL-Dekk's pools. Phase 7c
+  refuses normal maps by name because one drawn as diffuse renders in
+  iridescent blue and magenta; names run out, and the pixels do not. A
+  tangent-space normal is a unit vector packed around (0, 0, 1), so a flat one
+  is (128, 128, 255) and any real one stays near it. `_is_normal_map` refuses
+  blue >= 200 with red and green both inside 100..160. Over three maps it flags
+  exactly two textures: the one the name already catches, and this one.
+* **Only the first *connected* colour input counts.** `constant_colour` tried
+  DiffuseColor, and on failing to fold it fell through to EmissiveColor.
+  TOXIKK's `SF_M_SnowBarrier` has a textured diffuse -- so it declined, quite
+  correctly -- and an unused EmissiveColor that folds to zero. The result was a
+  `ColorModifier` multiplying the barrier by **black**. The first connected
+  input is the one that defines the surface, and if it does not fold then the
+  colour is in a texture and there is no constant tint. A folded pure black is
+  refused outright as well: nobody writes black as a tint, it is an input left
+  at zero, and multiplying by it erases the surface.
+* **Names longer than an FName.** `MaterialSet` appends a tag and a two-letter
+  kind to the texture's name, and UT3 has textures named after the material
+  that flattened them:
+  `M_UN_Volumetrics_Lightbeam_Cheap_02_FloodlightsCold_Flattened_c305CM` is 68
+  characters against `NAME_SIZE = 64` (Core/Inc/UnName.h:16). Past that the
+  name is truncated on import while the reference keeps its length, and for a
+  material `ucc make` fails outright. Both `MaterialSet._unique` and
+  `TextureSet._unique` now trim the base to fit, counter included -- the
+  texture side was over the limit too, silently.
+* **Two maps wanting one package.** `~/TOXIKK` is the working copy (the Steam
+  install with the UDK zip over it, see "Running the UDK editor under Wine"),
+  and it is not interchangeable with the Steam one: `BL-Dekk.udk` differs
+  between them, so `batch.py` now prefers it. But UDK's installer also drops
+  its own sample maps into `Maps/UT3`, including a `DM-Deck.udk` that lands on
+  the same output name and the same package as UT3's DM-Deck -- the second run
+  clobbering the first's source tree and then failing to build against the
+  other's t3d. `SKIP_MAP_DIRS` leaves UDK's sample tree alone, and a package
+  claimed twice is now reported rather than silently overwritten.
+
+*One bug this found in Phase 14a.* `drop_distant_effects` was calling
+`furthest_from` without the "is it outside the play area" guard the backdrop
+measurement uses. That function answers "how far can a player get from this",
+so for anything standing *in* the level it returns the map's own diagonal —
+and DM-HeatRay is 131,761uu across, so all 22 of its light beams were being
+thrown away as too distant to draw. 19 of them are in the map and now convert.
+
+*Verified in the editor on DM-Deck*, over four rounds: 14a drew the effects at
+all, 14b gave them their colours, 14c their strengths, 14d the right textures.
+Overdraw and sorting were the things to watch and neither has been a problem on
+this map. DM-HeatRay and TOXIKK's BL-Dekk are built too, and between them found
+everything in 14e to 14h. None of the three has been walked since 14h, which
+changes all of them. No other map has been looked at, and the regression batch
+has not been run since 14b -- which now matters more than it did, since 14d and
+14h both moved texture resolution. Not yet done: masked materials with a
+separate `..._M` opacity texture could become a `Shader` with Diffuse and
+Opacity instead of the DXT5 repack Phase 5e does; a `TextureCoordinate`'s
+UTiling/VTiling could become a `TexScaler` (it is baked into mesh UVs today and
+ignored on BSP); and `EFFECT_SUBSTITUTES`/`MATERIAL_SUBSTITUTES` could hand goo
+and water back to UT3's own materials now that those convert.
 
 ## 3. What turned out hard
 
@@ -1001,20 +2148,27 @@ Revised against what actually happened, rather than what was expected.
   UT3 geometry play fine.
 - **UT2004's limits were not the problem; `UCC.exe`'s address space was.** See
   Phase 11. No map needed splitting.
-- **Cooked-package quirks were mild.** Everything needed survived cooking. The
-  one real gap is UE3 material graphs, which no amount of parsing turns into a
-  UE2 Shader or FinalBlend from a `ucc make`.
+- **Cooked-package quirks were mild.** Everything needed survived cooking. UE3
+  material graphs were called the one real gap here, on the grounds that a
+  `ucc make` cannot produce a UE2 Shader or FinalBlend. That was wrong — see
+  Phase 14.
 - **Per-poly mesh collision has no build-time fix.** `UseSimpleKarmaCollision`
   defaults on, and forcing it off at import broke every mesh. It is set by hand
   in the editor where a mesh needs it.
 
 ## 4. Where this stands
 
-Diminishing returns. The pipeline is complete and the general faults are fixed;
-what is left is per-map polish, found by looking.
+The pipeline is complete and the general faults are fixed. What is left is
+per-map polish found by looking — and Phase 14's generated materials, which
+build and resolve correctly but have not been walked through in the editor.
 
-**Not planned:** particles and emitters, Kismet, UE3 shader materials, SpeedTree,
-PostProcessVolume, skeletal meshes, destructibles, UDK static meshes.
+**Not planned:** particles and emitters, Kismet, SpeedTree, PostProcessVolume,
+skeletal meshes, destructibles. (UE3 shader materials were on this list until
+Phase 14 showed they can be built.)
+
+**Wanted, not done:** TOXIKK's CC maps convert as `DM-` because Cell Capture's
+objectives do not convert. Assault is the mode that matches and the mod is
+installed; what is missing is the objective conversion, not the game type.
 
 **Known and accepted:**
 
@@ -1027,8 +2181,12 @@ PostProcessVolume, skeletal meshes, destructibles, UDK static meshes.
 - A follower attached to a rotating mover turns on its own pivot instead of
   orbiting the leader.
 
-**If picking this up again:** the editor pass is the work. Open a converted map,
+**If picking this up again:** run `batch.py` first — Phase 14 changed texture
+resolution for 32 materials across the stock maps and only DM-Deck has been
+looked at. Then the editor pass, which is the work. Open a converted map,
 walk it, and compare against the same map in the UT3 editor; every entry in
 Phase 12 started that way. `batch.py --match <name> --build` turns a fix into a
-rebuilt map, and the 15 test scripts in `tests/` read the stock UT3 maps
+rebuilt map, and the 15 UT3 test scripts in `tests/` read the stock maps
 directly, so a regression shows up against real data rather than a fixture.
+`tests/test_udk.py` does the same against TOXIKK's packages, checking the mesh
+reader against UDK's own OBJ export, and skips cleanly when TOXIKK is absent.

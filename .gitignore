@@ -11,3 +11,6 @@ out-*/
 releases/
 
 # gui/ has its own .gitignore for build/ and build-win/.
+
+# pytest's cache, which appears as soon as the tests are run under pytest.
+.pytest_cache/
