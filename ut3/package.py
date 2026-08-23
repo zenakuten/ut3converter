@@ -10,6 +10,7 @@ chunks that cover a requested range.
 
 import ctypes
 import ctypes.util
+import os
 import struct
 import zlib
 
@@ -36,11 +37,55 @@ UDK_NO_COMPONENT_MAP = 639
 _lzo = None
 _lz4 = None
 
+# Where the release puts its bundled DLLs: beside ut3conv.py, one level up from
+# this file. Windows will not look there on its own -- LoadLibrary searches the
+# directory of the running executable, which is python.exe, not the folder the
+# scripts were unzipped into -- so the full path has to be offered explicitly.
+_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Real filenames per platform, because a hard-coded Linux soname is what shipped
+# in v1 and a Windows user got "Could not find module 'liblzo2.so.2'" for every
+# UT3 map, which are all LZO. find_library() knows each system's conventions but
+# returns None often enough on Windows that actual names have to back it up.
+_LZO_NAMES = ("lzo2.dll", "liblzo2-2.dll", "liblzo2.dll",
+              "liblzo2.so.2", "liblzo2.so",
+              "liblzo2.2.dylib", "liblzo2.dylib")
+_LZ4_NAMES = ("lz4.dll", "liblz4.dll", "liblz4-1.dll",
+              "liblz4.so.1", "liblz4.so",
+              "liblz4.1.dylib", "liblz4.dylib")
+
+_INSTALL_HINT = {
+    "lzo2": "Arch: lzo   Debian/Ubuntu: liblzo2-2   macOS: brew install lzo",
+    "lz4": "Arch: lz4   Debian/Ubuntu: liblz4-1    macOS: brew install lz4",
+}
+
+
+def _load_codec(soname, names):
+    """Load a compression library, trying every name a platform might use.
+
+    Raises with what was tried and what to install, rather than letting a
+    ctypes OSError name a file the user has never heard of.
+    """
+    tried = []
+    found = ctypes.util.find_library(soname)
+    for name in ([found] if found else []) + list(names):
+        for candidate in (name, os.path.join(_HERE, name)):
+            try:
+                return ctypes.CDLL(candidate)
+            except OSError:
+                tried.append(candidate)
+    raise RuntimeError(
+        "cannot load the %s library, which this package needs to decompress.\n"
+        "Install it (%s), or on Windows put %s beside ut3conv.py.\n"
+        "Tried: %s"
+        % (soname, _INSTALL_HINT.get(soname, "see your package manager"),
+           names[0], ", ".join(tried)))
+
 
 def _lzo_decompress(src, out_len):
     global _lzo
     if _lzo is None:
-        _lzo = ctypes.CDLL("liblzo2.so.2")
+        _lzo = _load_codec("lzo2", _LZO_NAMES)
         # __lzo_init_v2 is what the lzo_init() macro expands to; harmless if absent.
         if hasattr(_lzo, "__lzo_init_v2"):
             _lzo.__lzo_init_v2(1, -1, -1, -1, -1, -1, -1, -1, -1, -1)
@@ -55,8 +100,7 @@ def _lzo_decompress(src, out_len):
 def _lz4_decompress(src, out_len):
     global _lz4
     if _lz4 is None:
-        name = ctypes.util.find_library("lz4") or "liblz4.so.1"
-        _lz4 = ctypes.CDLL(name)
+        _lz4 = _load_codec("lz4", _LZ4_NAMES)
         _lz4.LZ4_decompress_safe.restype = ctypes.c_int
     out = ctypes.create_string_buffer(out_len)
     n = _lz4.LZ4_decompress_safe(src, out, ctypes.c_int(len(src)),

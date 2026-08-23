@@ -102,13 +102,20 @@ cmake --build build-win
 Dear ImGui is fetched and built by the same cross-compiler, so SDL3 is the only
 package that has to exist for Windows.
 
-Two DLLs have to sit beside `ut3convgui.exe`, both from
-`/usr/x86_64-w64-mingw32/bin/`:
+Four DLLs have to sit beside `ut3convgui.exe`, all from
+`/usr/x86_64-w64-mingw32/bin/` (`mingw-w64-sdl3`, `mingw-w64-lzo`,
+`mingw-w64-lz4`):
 
 | | |
 |---|---|
 | `SDL3.dll` | SDL itself |
 | `libssp-0.dll` | Arch builds that SDL3.dll with the stack protector, so it imports this. Miss it and the exe dies at load with `status c0000135` and no window |
+| `lzo2.dll` | UE3 compresses package chunks with LZO, and every stock UT3 map uses it. The scripts load this through ctypes, not the exe |
+| `lz4.dll` | The same for Gears of War Reloaded, which compresses with LZ4 |
+
+The last two are for the Python scripts rather than the interface, which is why
+`objdump -p ut3convgui.exe` does not list them. Linux users install `lzo` and
+`lz4` from their distribution instead, the same as SDL3.
 
 Nothing else: the toolchain file links the GCC runtime statically, so
 `libgcc_s_seh-1.dll`, `libstdc++-6.dll` and `libwinpthread-1.dll` are not
@@ -123,9 +130,10 @@ A release is self-contained: the binary sits beside the converter it drives, so
 `ut3conv.py` is found with nothing to configure.
 
 ```
-ut3convgui-<platform>-v1/
+ut3convgui-<platform>-v2/
     ut3convgui[.exe]     the interface
     SDL3.dll             Windows only, with libssp-0.dll beside it
+    lzo2.dll lz4.dll     Windows only: the package codecs, for the scripts
     ut3conv.py           the converter
     batch.py             every map, one package per build
     convert/ ut3/ ut2/   the modules those two import
@@ -134,8 +142,10 @@ ut3convgui-<platform>-v1/
 ```
 
 Python 3 is the one thing not in the box, since the scripts are what do the
-converting. Linux also needs SDL3 from your distribution; the Windows zip
-carries its own.
+converting. Linux also needs SDL3, LZO and LZ4 from your distribution (Arch
+`sdl3 lzo lz4`, Debian/Ubuntu `libsdl3-0 liblzo2-2 liblz4-1`); the Windows zip
+carries its own. Without LZO no stock UT3 map opens, since all of them are
+LZO-compressed; without LZ4, no Gears of War Reloaded map.
 
 `tests/` and `tools/` are left out, being neither imported nor needed to
 convert a map.
