@@ -275,24 +275,64 @@ def _collect(pkg, index, export, depth, seen, found, params=None, follow=None):
                      params, follow)
 
 
-# What an opacity texture is called. "falloff" and "mask" are penalised in
-# score_texture_name as evidence that a texture is *not* the diffuse -- which is
-# right, and is also exactly what an opacity map is supposed to be. Applying the
-# diffuse rule to the opacity walk marks down the one texture that walk exists
-# to find.
-_OPACITY_EXEMPT = ("falloff", "mask")
+# What the texture an *effect* is drawn with is called, where it differs from
+# the diffuse rule. "falloff" and "mask" are penalised in score_texture_name as
+# evidence that a texture is not the diffuse, which is right for a wall and
+# wrong for a light cone: an effect surface has no albedo at all, and the
+# falloff is the entire shape of the thing.
+#
+# Merely lifting the penalty is not enough, because it leaves a falloff level
+# with anything unremarkable and graph order then decides -- which is how
+# HeatRay's cones came to be drawn with their dust grain. "falloff" scores as a
+# bonus instead, at the same 20 the diffuse words carry: on an unlit additive
+# surface, naming yourself the falloff is exactly as strong a claim to being
+# what gets drawn as naming yourself the diffuse.
+#
+# "mask" splits on which input the texture was reached through, and the two
+# answers are opposite. Down a *colour* input a mask is a cutout applied to
+# something else, and that something else is what gets drawn: KBarge's icicles
+# are unlit additive and reach T_UN_BSP_Snow_IcicleMask alongside
+# T_UN_Terrain_Snow_02, and neutralising the penalty there tied them so graph
+# order drew the icicles as their own silhouette instead of as snow. Coret's
+# bubble tube did the same and came out painted with a Coca-Cola sign's mask.
+# Down *Opacity* a mask is the opacity, by definition -- UN_Glass's panes reach
+# TM_UN_Glass_BasicPane_01_Mask that way, against T_LT_Base_02_S, a specular
+# map from an unrelated asset that scores 20 only because "base" is in
+# _WORD_BONUS and happens to be in its package name.
+_EFFECT_WORDS = {"falloff": -20}
+_OPACITY_WORDS = {"falloff": -20, "mask": 0}
+
+# An effect surface: no lighting pass touches it and it is not drawn solid. A
+# masked cutout is deliberately not one -- there the mask is the cutout and the
+# colour is a separate texture, which is the ordinary diffuse case.
+EFFECT_BLENDS = ("BLEND_Additive", "BLEND_Translucent", "BLEND_Modulate")
 
 
-def score_opacity_name(name):
-    """Lower is better: how likely this name is the map an effect is shaped by."""
+def is_effect_material(props):
+    """Does this Material's own state say it is an effect? See _EFFECT_EXEMPT."""
+    return (str(props.get("LightingModel", "MLM_Phong")) == "MLM_Unlit"
+            and str(props.get("BlendMode", "BLEND_Opaque")) in EFFECT_BLENDS)
+
+
+def _rescored(name, table):
     score = score_texture_name(name)
     if score >= DISQUALIFIED:
         return score
     low = name.lower()
     for token, penalty in _WORD_PENALTY:
-        if token in _OPACITY_EXEMPT and token in low:
-            score -= penalty
+        if token in low and token in table:
+            score += table[token] - penalty
     return score
+
+
+def score_effect_name(name):
+    """Lower is better: how likely this name is the map an effect is shaped by."""
+    return _rescored(name, _EFFECT_WORDS)
+
+
+def score_opacity_name(name):
+    """score_effect_name, for a texture reached down an opacity input."""
+    return _rescored(name, _OPACITY_WORDS)
 
 
 def _stem(name):
@@ -727,6 +767,16 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None, params=None):
         return inherited
 
     # A plain Material: follow the diffuse input through the expression graph.
+    #
+    # An effect scores its candidates by a different rule -- see
+    # score_effect_name. HeatRay's light cones are the case the exemption exists
+    # for: M_LT_Light_SM_Lightcone01 computes
+    # (Dust02_panned + Dust02_panned) * LightColor * Falloff01 * Falloff02, and
+    # the two falloffs are the cone while the dust is animated grain added over
+    # it. Under the diffuse rule the falloffs take the 60-point "falloff"
+    # penalty and T_LT_Light_SM_LightCone_Dust02 -- flat, shapeless noise --
+    # scores 0 and wins, so the cone rendered as a grey static panel.
+    scorer = score_effect_name if is_effect_material(props) else None
     for key in DIFFUSE_INPUTS:
         value = props.get(key)
         ref_expr = _expression_ref(value)
@@ -736,7 +786,8 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None, params=None):
         if expr is None:
             continue
         found_owner, found, sample = _walk(expr_owner, index, expr, depth, set(),
-                                            reject, export.name, params)
+                                            reject, export.name, params,
+                                            scorer=scorer)
         if found is not None:
             if sample is not None:
                 _LAST_SAMPLE[0] = sample
@@ -1030,7 +1081,13 @@ def resolve_emissive(pkg, index, ref, reject=None):
 # Vector parameters that tint the diffuse map rather than replacing it. Matched
 # only when the material's graph actually reads the parameter -- see
 # diffuse_tint -- so the name narrows a candidate rather than deciding one.
-_DIFFUSE_TINTS = ("diffusecolor", "basecolor", "diffusetint", "color", "tint")
+# "lightcolor" is here for the volumetrics: a light cone's instances differ in
+# nothing else. M_LT_Light_SM_Lightcone01 multiplies LightColor straight into
+# its emissive chain, and it is the only vector parameter the graph reads, so
+# without it HeatRay's eight cones -- colorA, colorC, colorE, colorG, Blue,
+# Red -- all render as the same full-brightness white on an additive blend.
+_DIFFUSE_TINTS = ("diffusecolor", "basecolor", "diffusetint", "color", "tint",
+                  "lightcolor")
 
 
 def diffuse_tint(pkg, index, ref):

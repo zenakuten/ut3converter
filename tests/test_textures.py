@@ -579,7 +579,8 @@ def main(path):
     # multiplies them together, they score identically, and the scan took
     # whichever came first in the export table -- T_EV_LightBeam_Falloff_02, a
     # round blob, in place of the cone. 126 materials across the map set.
-    from ut3.objects.material import _LAST_SAMPLE, resolve_diffuse
+    from ut3.objects.material import (_LAST_SAMPLE, resolve_diffuse,
+                                      score_texture_name)
 
     def drawn(name):
         found = p.find(name)
@@ -606,6 +607,63 @@ def main(path):
     # input has come up empty.
     check("a material that states its diffuse the usual way is unaffected",
           drawn("M_HU_Deco_SM_CitySignStores")[0], "T_HU_Deco_SM_CitySignStores_D")
+
+    # An effect that *does* put a texture in its colour path still needs the
+    # scoring changed, because the diffuse rule marks down the one texture that
+    # carries its shape. M_LT_Light_SM_Lightcone01 computes
+    # (Dust02_panned + Dust02_panned) * LightColor * Falloff01 * Falloff02: the
+    # falloffs are the cone, the dust is animated grain over it. Under
+    # score_texture_name the falloffs take the 60-point penalty and the dust --
+    # flat, shapeless noise, and the only candidate scoring 0 -- won, so
+    # StaticMeshActor_1446 rendered as a grey static panel.
+    from ut3.objects.material import (is_effect_material, score_effect_name,
+                                      score_opacity_name)
+
+    check("a light cone is drawn with its falloff, not its grain",
+          drawn("M_LT_Light_SM_Lightcone01_colorG")[0],
+          "T_LT_Light_SM_LightCone_Falloff01")
+    check_that("the cone is recognised as an effect",
+               is_effect_material(base_material(
+                   p, index, p.ref(p.find("M_LT_Light_SM_Lightcone01")[0].index))[2]))
+    # A bonus, not a mere exemption. Neutralising the penalty leaves a falloff
+    # level with anything unremarkable and graph order then decides -- which is
+    # the dust again, since it is reached first.
+    check("on an effect a falloff is as strong a claim as a diffuse",
+          score_effect_name("T_LT_Light_SM_LightCone_Falloff01"),
+          score_texture_name("T_Something_D"))
+    check("while the diffuse rule marks the same name down",
+          score_texture_name("T_LT_Light_SM_LightCone_Falloff01"), 60)
+    # "mask" splits on the input it was reached through, and only Opacity gets
+    # the exemption. Down a colour input a mask is a cutout applied to something
+    # else: KBarge's icicles are unlit additive and reach their own silhouette
+    # alongside the snow they are painted with, and exempting it there drew the
+    # icicles as the silhouette.
+    check("a mask reached down a colour input stays marked down",
+          score_effect_name("T_UN_BSP_Snow_IcicleMask"), 30)
+    check("but down Opacity a mask is the opacity",
+          score_opacity_name("TM_UN_Glass_BasicPane_01_Mask"), 0)
+
+    # The cones' instances differ in nothing but a LightColor vector parameter,
+    # so without it in _DIFFUSE_TINTS all eight of HeatRay's rendered as the
+    # same full-brightness white on an additive blend. It is the only vector
+    # parameter this graph reads, so there is nothing for it to be confused
+    # with.
+    from ut3.objects.material import diffuse_tint
+
+    def tint(name):
+        found = p.find(name)
+        return found and diffuse_tint(p, index, p.ref(found[0].index))
+
+    check("a light cone takes its LightColor as a tint",
+          tint("M_LT_Light_SM_Lightcone01_colorG"), (89, 89, 99))
+    # And it is not only the cones: every emissive light in the map states its
+    # colour this way, so the same 93 materials across the map set that were
+    # drawing at full white now carry the tint their names promise.
+    check("a yellow fluorescent is yellow",
+          tint("MI_LT_Light_SM_Fluorescent01_Yellow"), (224, 220, 26))
+    # The master leaves it at its default, which is not a no-op either.
+    check("a light that states no colour still gets none",
+          tint("M_HU_Deco_SM_CitySignStores"), None)
 
     # A Panner on the coordinates is one of the few nodes with an exact UE2
     # counterpart. UE2 states it as a rotator plus a rate, and the rate is the

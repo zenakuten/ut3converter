@@ -1766,6 +1766,78 @@ texture at conversion time, would close that -- the texture pipeline already
 does comparable work in `bake_self_alpha`. Not needed for the shape to read
 correctly, which was the reported problem.
 
+**Phase 20 -- what an effect's texture is called, and what colour it is.**
+Reported the same way as Phase 19, from the same map: `StaticMeshActor_1446`
+looks wrong against UT3. It is a light cone, and Phase 19 had not touched it,
+because this family keeps its texture in the colour path after all.
+
+`M_LT_Light_SM_Lightcone01` computes
+
+    EmissiveColor = (Dust02_panned + Dust02_panned) * LightColor * Falloff01
+                                                                 * Falloff02
+
+The falloffs are the cone; the dust is animated grain multiplied over it. The
+diffuse walk found all four and `score_texture_name` chose the dust, because
+"falloff" carries a 60-point penalty -- a rule written against cubemap
+falloffs -- while `T_LT_Light_SM_LightCone_Dust02` is flat shapeless noise
+whose name says nothing and so scores 0. The cone rendered as a grey static
+panel, and the dust's Panner came with it, so the panel slid.
+
+So `score_effect_name` now applies to the colour walk too, gated on
+`is_effect_material`: unlit, and a blend of Additive, Translucent or Modulate.
+A masked cutout is deliberately not an effect -- there the mask is the cutout
+and the colour is a separate texture, which is the ordinary diffuse case.
+
+Two things this took to get right:
+
+- **A bonus, not an exemption.** Merely lifting the penalty leaves the falloff
+  level with the dust at 0, and graph order then picks the dust, which is
+  reached first. "falloff" scores -20 for an effect instead: on an unlit
+  additive surface, naming yourself the falloff is exactly as strong a claim to
+  being what gets drawn as naming yourself the diffuse.
+- **"mask" splits on the input it came down, and the two answers are
+  opposite.** Exempting it everywhere was tried and cost two maps: KBarge's
+  icicles are unlit additive and reach `T_UN_BSP_Snow_IcicleMask` alongside the
+  `T_UN_Terrain_Snow_02` they are painted with, and neutralising the penalty
+  tied them so the icicles drew as their own silhouette; Coret's bubble tube
+  came out painted with a Coca-Cola sign's mask. Down a colour input a mask is
+  a cutout applied to something else, and that something else is what gets
+  drawn. Down *Opacity* a mask is the opacity by definition, and UN_Glass's
+  panes need it -- otherwise they lose to `T_LT_Base_02_S`, an unrelated
+  specular map that scores 20 only because "base" is in `_WORD_BONUS` and
+  happens to be in its package name. Hence two scorers, `score_effect_name` and
+  `score_opacity_name`.
+
+*And the colour, which was the louder half of "looks off".* The cone drew at
+full white. `LightColor` was not in `_DIFFUSE_TINTS`, so `diffuse_tint`
+declined it -- yet it is the only vector parameter this graph reads, and the
+cones' instances differ in nothing else. Adding it tinted **93 materials across
+28 maps**, and every one of them is a light: WAR-Downtown's 46 window lights
+(Red/Blue core towers, bright and dim variants that had all been drawing
+identically), BL-Foundation's 16 city-block deco lights, Coret's 9, team-
+coloured powerpole tops at (255,0,0) and (0,0,129), `MAT_LED_White_OFF_INST` at
+(187,187,183) and `..._LightOff` at (63,63,63) -- both of which had been as
+bright as their lit siblings.
+
+*Measured over all 157 maps, against Phase 19:*
+
+    18 rows change texture     11 light cones + 1 distance cone: dust -> falloff
+                               4 windy/snow fog sheets: cloud noise -> falloff
+                               2 volumetrics: dust panner -> falloff
+    17 rows lose a panner      each belonged to the dust or cloud sample that
+                               is no longer the one drawn
+    93 rows gain a tint        listed above
+
+DM-HeatRay rebuilt: all 9 cone actors carry
+`FinalBlend'DMHeatRayTex.T_LT_Light_SM_LightCone_Falloff01_313dFB'` over a
+ColorModifier at (89,89,99) over an unlit Shader, on FB_Brighten -- and 32
+actors that had no skin at all (20 window lights, 12 fluorescents) gained a
+tinted one.
+
+*Still approximate.* The cone is static where UT3 animates it with the dust
+grain, and the same one-texture-per-stage limit from Phase 19 applies: the
+product of two falloffs is drawn as the first of them.
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes
