@@ -18,6 +18,7 @@ inline const Opt kT3dOptions[] = {
     { "scale", "--scale", "scale", Kind::Float, "1.0", "world scale factor (default 1.0)", false, Browse::None, {  } },
     { "surface_scale", "--surface-scale", "surface-scale", Kind::Float, "1.0", "extra multiplier on BSP surface UVs; 1.0 reproduces UT3's own tiling (the real conversion is UE3_BSP_UV_SCALE)", false, Browse::None, {  } },
     { "no_package", "--no-package", "no-package", Kind::Flag, "false", "emit only the .t3d, with no buildable asset package", false, Browse::None, {  } },
+    { "no_materials", "--no-materials", "no-materials", Kind::Flag, "false", "do not build UE2 Shader/FinalBlend objects for translucent, additive or unlit surfaces; every surface falls back to a flat texture, which is what the converter did before", false, Browse::None, {  } },
     { "no_meshes", "--no-meshes", "no-meshes", Kind::Flag, "false", "omit static meshes (requires --textures otherwise)", false, Browse::None, {  } },
     { "no_terrain", "--no-terrain", "no-terrain", Kind::Flag, "false", "omit converted terrain", false, Browse::None, {  } },
     { "no_movers", "--no-movers", "no-movers", Kind::Flag, "false", "omit Movers (Matinee-animated InterpActors then stay parked where UT3 placed them)", false, Browse::None, {  } },
@@ -36,6 +37,7 @@ inline const Opt kT3dOptions[] = {
     { "no_zone_info", "--no-zone-info", "no-zone-info", Kind::Flag, "false", "do not emit the ZoneInfo that terrain needs to render", false, Browse::None, {  } },
     { "keep_effect_meshes", "--keep-effect-meshes", "keep-effect-meshes", Kind::Flag, "false", "convert unlit translucent effect meshes (light beams, fog sheets) instead of skipping them; they import as opaque surfaces", false, Browse::None, {  } },
     { "light_gain", "--light-gain", "light-gain", Kind::Float, "32.0", "UE3 brightness 1.0 maps to this UE2 LightBrightness (default 32)", false, Browse::None, {  } },
+    { "ambient", "--ambient", "ambient", Kind::Int, "", "set the zone's AmbientBrightness (0-255) outright, overriding whatever the SkyLights give. A UDK map bakes its fill light into lightmaps and often has no SkyLight, leaving nothing for --ambient-gain to scale", false, Browse::None, {  } },
     { "ambient_gain", "--ambient-gain", "ambient-gain", Kind::Float, "16.0", "scales the UT3 SkyLight into a UT2004 AmbientBrightness (default 16)", false, Browse::None, {  } },
     { "light_radius_scale", "--light-radius-scale", "light-radius-scale", Kind::Float, "1.0", "widen every light's radius by this factor (default 1.0)", false, Browse::None, {  } },
     { "sky_mode", "--sky-mode", "sky-mode", Kind::Choice, "skybox", "skybox puts the dome in a SkyZoneInfo room so it reads as infinitely distant, at UT3's proportions; inline keeps it as ordinary level geometry, capped by UE2's 65536uu far plane", false, Browse::None, { "skybox", "inline" } },
@@ -60,15 +62,15 @@ inline const Opt kT3dOptions[] = {
 
 inline const Section kT3dSections[] = {
     { "Required", 0, 2 },
-    { "Package and scale", 2, 8 },
-    { "Leave out", 8, 25 },
-    { "Lighting", 25, 28 },
-    { "Sky", 28, 33 },
-    { "World brush", 33, 36 },
-    { "Terrain", 36, 38 },
-    { "Movers and sound", 38, 40 },
-    { "Warfare / Onslaught", 40, 45 },
-    { "Minimap", 45, 46 },
+    { "Package and scale", 2, 9 },
+    { "Leave out", 9, 26 },
+    { "Lighting", 26, 30 },
+    { "Sky", 30, 35 },
+    { "World brush", 35, 38 },
+    { "Terrain", 38, 40 },
+    { "Movers and sound", 40, 42 },
+    { "Warfare / Onslaught", 42, 47 },
+    { "Minimap", 47, 48 },
 };
 
 inline const Opt kInfoOptions[] = {
@@ -117,7 +119,7 @@ inline const Command kInspectCommands[] = {
     { "imports", kImportsOptions, 3 },
 };
 
-inline constexpr int kT3dOptionCount = 46;
+inline constexpr int kT3dOptionCount = 48;
 inline constexpr int kT3dSectionCount = 10;
 inline constexpr int kBatchOptionCount = 6;
 inline constexpr int kInspectCommandCount = 5;

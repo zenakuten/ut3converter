@@ -28,13 +28,15 @@ OUTPUT = os.path.join(os.path.dirname(HERE), "src", "spec_generated.h")
 # widget, default and tooltip all come from argparse.
 SECTIONS = [
     ("Package and scale", ["texture_package", "textures", "max_texture_size",
-                           "scale", "surface_scale", "no_package"]),
+                           "scale", "surface_scale", "no_package",
+                           "no_materials"]),
     ("Leave out", ["no_meshes", "no_terrain", "no_movers", "no_sounds",
                    "no_lights", "no_pickups", "no_paths", "no_player_starts",
                    "no_objectives", "no_teleporters", "no_teleporter_effect",
                    "no_onslaught", "no_volumes", "no_skybox", "no_minimap",
                    "no_zone_info", "keep_effect_meshes"]),
-    ("Lighting", ["light_gain", "ambient_gain", "light_radius_scale"]),
+    ("Lighting", ["light_gain", "ambient", "ambient_gain",
+                  "light_radius_scale"]),
     ("Sky", ["sky_mode", "sky_dome_margin", "sky_merge_distance",
              "shrink_backdrop", "keep_backdrop"]),
     ("World brush", ["world_margin", "world_cell", "no_world_brush"]),
