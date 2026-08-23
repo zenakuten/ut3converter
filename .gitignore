@@ -14,3 +14,14 @@ releases/
 
 # pytest's cache, which appears as soon as the tests are run under pytest.
 .pytest_cache/
+
+# More converter output. `out-*/` above covers batch.py's per-map folders, but
+# a plain `ut3conv.py -o out/...` run and batch.py's summary land here too.
+out/
+batchresults/
+
+# Debug dumps written beside the scripts while chasing a specific defect: brush
+# listings, editor build logs, a heightmap BMP. Root-scoped, so a .txt that is
+# part of the project (gui/CMakeLists.txt) is untouched.
+/*.txt
+/*.bmp
