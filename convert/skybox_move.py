@@ -117,3 +117,39 @@ def move_to_skybox(actors, map_center, sky_center, scale, name_prefix="Sky_"):
             properties.append(("bUnlit", "True"))
         moved.append(Actor(actor.cls, name_prefix + actor.name, properties))
     return moved
+
+
+def drop_distant_effects(actors, play_area, far_plane):
+    """Remove volumetric effect actors the far plane would clip anyway.
+
+    UT3 parks fog sheets and falloff spheres out at the horizon alongside the
+    backdrop, and once the converter started drawing them (Phase 14) one of
+    DM-Deck's landed 114,621uu from the play area. That is past UE2's far plane,
+    so it cannot be drawn where it stands whatever else happens -- but leaving
+    it in the actor list answered "is there scenery too far to draw?" with yes,
+    and moved the map's entire distant city into the skybox on the strength of
+    one invisible fog sheet.
+
+    Dropping it is the honest answer twice over: the effect cannot render at
+    that distance, and a map should not be restructured around geometry that
+    contributes nothing. Real backdrop scenery is untouched and still decides
+    the question on its own.
+
+    Only actors *outside* the play area are candidates, which is the same guard
+    the backdrop measurement uses and for the same reason: `furthest_from`
+    answers "how far can a player get from this", so for anything standing in
+    the level it returns the map's own diagonal. DM-HeatRay is 131,761uu across
+    and every one of its 22 light beams was being thrown away on that.
+
+    Returns (kept actors, dropped count).
+    """
+    kept, dropped = [], 0
+    for actor in actors:
+        if getattr(actor, "is_effect", False):
+            location = parse_location(actor)
+            if location is not None and is_outside(location, play_area) \
+                    and furthest_from(play_area, location) > far_plane:
+                dropped += 1
+                continue
+        kept.append(actor)
+    return kept, dropped

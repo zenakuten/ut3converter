@@ -92,7 +92,9 @@ def read_properties(data, names, offset, limit=64):
             r.idx()
         start = r.p
         if kind == "Bool":
-            value = bool((info >> 4) & 1)
+            # A bool carries no payload: its value is bit 7 of the info byte,
+            # where every other type keeps the array flag (UnClass.cpp:88).
+            value = bool(info & 0x80)
             out.append((name, kind, value))
             continue
         if kind == "Float":
@@ -108,6 +110,10 @@ def read_properties(data, names, offset, limit=64):
         elif kind == "Str":
             n = r.idx()
             value = data[r.p:r.p + n].rstrip(b"\0").decode("latin-1")
+        elif struct_name == "Color":
+            # BGRA on disk, and native: no nested property list to read.
+            b, g, red, a = data[r.p:r.p + 4]
+            value = "(R=%d,G=%d,B=%d,A=%d)" % (red, g, b, a)
         elif kind == "Vector" or struct_name == "Vector":
             value = tuple(round(v, 2) for v in struct.unpack_from("<3f", data, r.p))
         elif kind == "Rotator" or struct_name == "Rotator":

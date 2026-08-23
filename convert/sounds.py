@@ -185,12 +185,88 @@ def _ambient_node(pkg, index, props):
     return owner, node
 
 
+def _plain_range(node, low_key, high_key):
+    """The mean of a plain min/max float pair, or None if it is not stated.
+
+    UDK's `AmbientSoundSimple` states radius, volume and pitch as two plain
+    floats under names of its own -- `RadiusMin`/`RadiusMax`,
+    `VolumeMin`/`VolumeMax`, `PitchMin`/`PitchMax` -- where UT3 states each as
+    one `RawDistributionFloat` called `MinRadius`, `VolumeModulation` and
+    `PitchModulation`. Reading only UT3's names meant every TOXIKK ambient
+    sound fell back to the defaults: volume 1.0, so all 112 of BL-Dekk's came
+    out at SoundVolume 255, and radius sqrt(400*5000)/2 = 707 against a real
+    261. Loud, and audible from nearly three times too far.
+
+    The mean of the pair is the same reading `distribution_value` takes of a
+    uniform distribution, so the two paths agree about what a range means.
+    """
+    low, high = node.get(low_key), node.get(high_key)
+    if low is None and high is None:
+        return None
+    try:
+        if low is None:
+            return float(high)
+        if high is None:
+            return float(low)
+        return (float(low) + float(high)) / 2.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _slot_scales(node):
+    """(volume scale, pitch scale) averaged over an ambient's sound slots.
+
+    Each `SoundSlot` carries a `VolumeScale` and `PitchScale` that multiply the
+    actor's own range, and a `Weight` giving its share of the random draw. Most
+    ambients have one slot, so this is usually just that slot's numbers -- but
+    ignoring them made every TOXIKK sound louder than authored, the first of
+    BL-Dekk's being 0.55 in the actor and 0.5 in the slot for a real 0.275.
+    """
+    slots = node.get("SoundSlots")
+    if slots is None or not len(slots):
+        return 1.0, 1.0
+    volume = pitch = weight_total = 0.0
+    for slot in slots.as_props():
+        try:
+            weight = float(slot.get("Weight", 1.0))
+        except (TypeError, ValueError):
+            weight = 1.0
+        if weight <= 0.0:
+            continue
+        def _scale(key):
+            try:
+                return float(slot.get(key, 1.0))
+            except (TypeError, ValueError):
+                return 1.0
+        volume += _scale("VolumeScale") * weight
+        pitch += _scale("PitchScale") * weight
+        weight_total += weight
+    if weight_total <= 0.0:
+        return 1.0, 1.0
+    return volume / weight_total, pitch / weight_total
+
+
 def _levels(owner, index, node, volume_gain):
     """(SoundRadius, SoundVolume, SoundPitch) for a UT2004 actor."""
-    min_radius = distribution_value(owner, index, node.get("MinRadius"), UT3_MIN_RADIUS)
-    max_radius = distribution_value(owner, index, node.get("MaxRadius"), UT3_MAX_RADIUS)
-    volume = distribution_value(owner, index, node.get("VolumeModulation"), UT3_VOLUME)
-    pitch = distribution_value(owner, index, node.get("PitchModulation"), UT3_PITCH)
+    min_radius = _plain_range(node, "RadiusMin", "RadiusMin")
+    max_radius = _plain_range(node, "RadiusMax", "RadiusMax")
+    if min_radius is None or max_radius is None:
+        min_radius = distribution_value(owner, index, node.get("MinRadius"),
+                                        UT3_MIN_RADIUS)
+        max_radius = distribution_value(owner, index, node.get("MaxRadius"),
+                                        UT3_MAX_RADIUS)
+    volume = _plain_range(node, "VolumeMin", "VolumeMax")
+    if volume is None:
+        volume = distribution_value(owner, index, node.get("VolumeModulation"),
+                                    UT3_VOLUME)
+    pitch = _plain_range(node, "PitchMin", "PitchMax")
+    if pitch is None:
+        pitch = distribution_value(owner, index, node.get("PitchModulation"),
+                                   UT3_PITCH)
+
+    volume_scale, pitch_scale = _slot_scales(node)
+    volume *= volume_scale
+    pitch *= pitch_scale
 
     radius = sound_radius(min_radius, max_radius)
     sound_volume = max(1, min(UT2_VOLUME_FULL,

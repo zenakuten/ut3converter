@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Convert every UT3 map, and lay the results out the way the build expects.
+"""Convert every UT3 (and UDK) map, and lay the results out the way the build
+expects.
 
     ./batch.py --list                 what would be converted
     ./batch.py --match VCTF           convert those maps
@@ -50,9 +51,44 @@ EDITOR = os.environ.get("UT3CONV_EDITOR") or os.path.expanduser("~/UT2004_p23win
 UT3_ROOT = os.environ.get("UT3CONV_UT3_ROOT") or (
     "/home/josh/.local/share/Steam/steamapps/common/"
     "Unreal Tournament 3/UTGame/CookedPC")
+# UDK maps ship uncooked beside the .upk packages they reference, so the tree to
+# scan is the game's Maps folder rather than a cooked one. TOXIKK is the UDK
+# game to hand; set UT3CONV_UDK_ROOT for another, or to "" to skip UDK entirely.
+# ~/TOXIKK first: that is the working copy (the Steam install with the UDK zip
+# over it -- see "Running the UDK editor under Wine" in PLAN.md), and its maps
+# are not the same files. BL-Dekk.udk differs between the two.
+UDK_ROOT = os.environ.get("UT3CONV_UDK_ROOT")
+if UDK_ROOT is None:
+    for candidate in ("~/TOXIKK/UDKGame/Content/Maps",
+                      "~/.steam/steam/steamapps/common/TOXIKK/UDKGame/Content/Maps"):
+        UDK_ROOT = os.path.expanduser(candidate)
+        if os.path.isdir(UDK_ROOT):
+            break
+# UDK's Engine/Content, which the game does not ship: BL-Foundation places 118
+# EditorMeshes.TexPropPlane and 9 EngineMeshes.Sphere, and every UDK map uses
+# EngineVolumetrics for its light beams. Unpacking the UDK zip is enough --
+# it does not have to be installed over the game, and doing that stops TOXIKK
+# launching. The converter reads it through UT3CONV_EXTRA_CONTENT.
+UDK_ENGINE = os.environ.get("UT3CONV_UDK_ENGINE")
+if UDK_ENGINE is None:
+    for candidate in ("~/TOXIKK/Engine/Content", "~/TOXIKK_UDK/Engine/Content"):
+        UDK_ENGINE = os.path.expanduser(candidate)
+        if os.path.isdir(UDK_ENGINE):
+            break
+if os.path.isdir(UDK_ENGINE) and "UT3CONV_EXTRA_CONTENT" not in os.environ:
+    os.environ["UT3CONV_EXTRA_CONTENT"] = UDK_ENGINE
 
 # Not maps: the front end, the intro cinematic and the tutorials.
-SKIP_PREFIXES = ("UTFrontEnd", "EnvyEntry", "UTM-", "UTCin")
+SKIP_PREFIXES = ("UTFrontEnd", "EnvyEntry", "UTM-", "UTCin",
+                 # TOXIKK's front end and the UDK template map.
+                 "CRZMainMenu", "ToxikkEntry", "ExampleEntry", "BL-WorkshopMap")
+
+# UDK's own sample maps, which its installer drops into the game's Content tree
+# and which are not the game's maps at all. `Maps/UT3/DM-Deck.udk` is a UDK-era
+# sample of the map we already convert from the real UT3 install, and it lands
+# on the same output name and the same package -- the second run silently
+# clobbering the first, and then failing to build against the other's t3d.
+SKIP_MAP_DIRS = ("UT3", "Examples", "Mobile", "Showcases", "First")
 
 # UT3 ships campaign variants of some maps beside the versal ones -- _SP is the
 # single-player cut, _Necris and _Leviathan are the story reskins. They are
@@ -62,7 +98,14 @@ VARIANT_SUFFIXES = ("_SP", "_Necris", "_Leviathan")
 
 # UT3's Warfare is UT2004's Onslaught, and the map prefix has to say so or the
 # game will not list it.
-PREFIX_MAP = {"WAR-": "ONS-"}
+# TOXIKK's BloodLust is deathmatch under another name, and a map whose prefix
+# UT2004 does not know is listed under no game type at all.
+# TOXIKK's own prefixes are its game modes: BL is Bloodlust (deathmatch) and CC
+# is Cell Capture, a team objective mode. Neither mode's objectives convert, so
+# both land on DM- -- which is not just a fallback: a CC map's team-assigned
+# PlayerStarts are exactly what UT2004's Team Deathmatch wants, and a map left
+# under an unknown prefix appears in no gametype's list at all.
+PREFIX_MAP = {"WAR-": "ONS-", "BL-": "DM-", "CC-": "DM-"}
 
 # Where a converted name would land on a map that already exists. Only Torlan
 # does: UT2004 ships its own ONS-Torlan, and both would claim the same file.
@@ -72,6 +115,28 @@ RENAMES = {"WAR-Torlan": ("ONS-TorlanUT3", "TorlanUT3Tex")}
 EXTRA_FLAGS = {
     # One dim SkyLight, so the ambient floor alone leaves it too dark.
     "WAR-Torlan": ["--ambient-gain", "128"],
+    # No SkyLight at all -- TOXIKK lights this one with baked lightmaps and 364
+    # Lightmass area lights, none of which convert, so there is nothing for
+    # --ambient-gain to scale and the zone would get no ambient whatsoever.
+    "BL-Dekk": ["--ambient", "64"],
+    # Lit by one DirectionalLight and 48 baked lightmaps -- not a single point
+    # or spot light in the map -- so without an ambient the only thing lighting
+    # a converted BL-Cube is its Sunlight.
+    "BL-Cube": ["--ambient", "96"],
+    # 547 placed lights, eight times Dekk's, so most of its lighting survives
+    # conversion and it needs only a little fill for what the lightmaps did.
+    "BL-Foundation": ["--ambient", "32"],
+    # No SkyLight either, and 84 placed lights -- close to Dekk's 67, so the
+    # same fill. The one Sunlight it has over Dekk lights the open ground and
+    # does nothing for the interiors, which is where the darkness was.
+    "BL-Artifact": ["--ambient", "64"],
+    # 1297 placed lights, more than any other converted map, so most of its
+    # lighting survives and it needs no more fill than Foundation's.
+    "CC-Citadel": ["--ambient", "32"],
+    # Twelve lights, nine of which the mapper set to zero brightness -- so three
+    # live ones and a Sunlight for a daylight jungle map, and everything else is
+    # baked. As little placed lighting as BL-Cube has.
+    "BL-Ganesha": ["--ambient", "96"],
 }
 
 # Warfare maps carry countdown nodes and standalone nodes that only the
@@ -101,20 +166,39 @@ def package_name(base):
         return RENAMES[base][1]
     from ut3conv import _texture_package_name
 
+    # The extension is stripped either way; passing one keeps the call honest.
     return _texture_package_name(base + ".ut3")
 
 
 def discover(variants=False):
-    """Every convertible UT3 map, as (source, ut3 name, out name, package)."""
+    """Every convertible map, as (source, source name, out name, package)."""
     found = []
-    for path in sorted(glob.glob(os.path.join(UT3_ROOT, "**", "*.ut3"),
-                                 recursive=True)):
-        base = os.path.basename(path)[:-4]
+    sources = [(UT3_ROOT, "*.ut3")]
+    if UDK_ROOT:
+        sources.append((UDK_ROOT, "*.udk"))
+    paths = []
+    for root, pattern in sources:
+        if root and os.path.isdir(root):
+            paths += sorted(glob.glob(os.path.join(root, "**", pattern),
+                                      recursive=True))
+    for path in paths:
+        base = os.path.basename(path).rsplit(".", 1)[0]
         if any(base == s or base.startswith(s) for s in SKIP_PREFIXES):
             continue
         if not variants and base.endswith(VARIANT_SUFFIXES):
             continue
+        if os.path.basename(os.path.dirname(path)) in SKIP_MAP_DIRS:
+            continue
         found.append((path, base, out_name(base), package_name(base)))
+    # Two maps that want the same package would overwrite each other's source
+    # tree and then fail to build, which is a confusing way to find out.
+    claimed = {}
+    for path, base, out, package in found:
+        if package in claimed and claimed[package] != path:
+            print("  WARNING: %s and %s both want package %s; keeping the first"
+                  % (os.path.basename(claimed[package]), os.path.basename(path), package))
+        claimed.setdefault(package, path)
+    found = [entry for entry in found if claimed[entry[3]] == entry[0]]
     # By the name the map ends up with, so a build group is a coherent set
     # rather than whatever order the two Maps folders happened to glob in.
     found.sort(key=lambda entry: entry[2].lower())
@@ -176,7 +260,11 @@ def set_edit_package(package):
 
     if START in text and END in text:
         head, rest = text.split(START, 1)
-        _old, tail = rest.split(END, 1)
+        # Take the newline that ends the block with it. `head` already carries
+        # the one before START, so leaving this behind glues two together and
+        # the file grows a blank line on every single build.
+        _old, tail = (rest.split(END + "\n", 1) if END + "\n" in rest
+                      else rest.split(END, 1))
     else:
         at = text.rfind("EditPackages=")
         at = text.find("\n", at) + 1
@@ -224,9 +312,11 @@ def clear_edit_package():
     if START not in text or END not in text:
         return False
     head, rest = text.split(START, 1)
-    _old, tail = rest.split(END, 1)
+    _old, tail = (rest.split(END + "\n", 1) if END + "\n" in rest
+                  else rest.split(END, 1))
     with open(ini, "wb") as handle:
-        handle.write((head + START + "\n" + END + tail).encode("latin-1", "replace"))
+        handle.write((head + START + "\n" + END + "\n" + tail)
+                     .encode("latin-1", "replace"))
     return True
 
 

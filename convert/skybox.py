@@ -45,7 +45,20 @@ FAR_CLIPPING_PLANE = 65536.0
 VIEW_SAFETY = 0.95
 
 # Mesh names that look like sky geometry.
-SKY_NAME_HINTS = ("_sky_", "skydome", "_dome", "skybox")
+# UT3 names its sky `S_UN_Sky_SM_SkyDome05` and TOXIKK names its `sm_skybox`,
+# but three of TOXIKK's six maps use a *sphere* instead -- `SM_SkySphere` on
+# BL-Ganesha and BL-Cube, `SM_SkySphere_4UVChannels` on BL-Foundation -- and
+# none of them matched. Those maps got no skybox at all: the sphere stayed in
+# the level as ordinary geometry, 163,840uu across inside a 72,835uu world, so
+# most of it fell outside the void and the rest past the far plane.
+#
+# "skysphere" rather than plain "sky" on purpose. "sky" alone matches
+# `SM_ShaneSky_01` too, which BL-Artifact and CC-Citadel both place alongside
+# the `sm_skybox` they already use -- and since find_sky_meshes returns the
+# largest first, ShaneSky's 106,516uu radius would take over from a skybox that
+# works today. Nothing here says which of the two is the intended dome, so the
+# hint stays narrow enough not to have to guess.
+SKY_NAME_HINTS = ("_sky_", "skydome", "_dome", "skybox", "skysphere")
 
 # Room size and how much of it the dome should fill.
 #
@@ -75,7 +88,7 @@ def find_sky_meshes(pkg, index, mesh_set):
     from ut3.objects.staticmesh import read_static_mesh
 
     found = []
-    for name, (owner, export, _overrides) in mesh_set.meshes.items():
+    for name, (owner, export, _overrides, _over_pkg) in mesh_set.meshes.items():
         if not looks_like_sky(name):
             continue
         mesh = read_static_mesh(owner, export)
