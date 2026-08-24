@@ -1166,6 +1166,47 @@ def diffuse_tint(pkg, index, ref):
     return colour
 
 
+# Where a colour that gets drawn can be stated. The first one present wins, the
+# way resolve_diffuse walks DIFFUSE_INPUTS: a material with no DiffuseColor at
+# all draws whatever its EmissiveColor computes.
+_SCALE_INPUTS = ("DiffuseColor", "EmissiveColor", "BaseColor")
+
+
+def diffuse_scale(pkg, index, ref):
+    """The constant brightness a material multiplies its colour map by, or None.
+
+    A sibling of `diffuse_tint`: that one reads a vector parameter an instance
+    overrides, this one a plain scalar the material multiplies in. UT3 uses it
+    to reuse one texture at two brightnesses without authoring a second --
+    HeatRay's `M_HU_Deco_SM_CitySign03b` and `..._05b` back their signs with
+    `T_HU_Base_BSP_Concrete01`, the same concrete the walls use, at
+    `Constant(0.1)`. Drawn at 1.0 the boards came out as white slabs, which is
+    what StaticMeshActor_2017 and StaticMeshActor_462 were reported as.
+
+    See `graph.product_factor` for how narrow the shape it accepts is, and why.
+    Only a dimming factor converts: UE2's ColorModifier multiplies by a byte, so
+    a value above 1 is a brightness boost it cannot express -- `..._CitySignStores`
+    wants its glow at 5.0 and does not get it. Zero is refused for the same
+    reason `diffuse_tint` refuses black: DM-Deck's teleporter fingers fold to it
+    through a mask this cannot follow, and drawn black the surface disappears.
+    """
+    from . import graph as G
+
+    owner, _base, props = base_material(pkg, index, ref)
+    if props is None:
+        return None
+    params = G.collect_parameters(pkg, index, ref)
+    for key in _SCALE_INPUTS:
+        expr = _expression_ref(props.get(key))
+        if expr is None or expr.is_null:
+            continue
+        level = G.product_factor(owner, index, expr, params)
+        if level is None or not 0.0 < level < 1.0:
+            return None
+        return level
+    return None
+
+
 def _live_vectors(pkg, index, ref, live, depth=8):
     """{name: (r, g, b)} for live vector parameters, leaf first."""
     out = {}

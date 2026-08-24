@@ -514,6 +514,48 @@ _SPINE = {
 }
 
 
+def product_factor(pkg, index, ref, params=None):
+    """The constant one side of a top-level Multiply contributes, or None.
+
+    Deliberately much narrower than `constant_scale`, which descends the whole
+    Multiply tree and multiplies every constant it meets. That is right for an
+    opacity chain, whose level is what the whole product amounts to. It is wrong
+    for a colour: the factors buried in a fresnel or detail branch are not
+    brightness, and taken as one they produce numbers no surface could be drawn
+    at -- measured over the map set, `constant_scale` on a colour input returns
+    values down to 0.0016 for 133 materials.
+
+    So only one shape counts, the shape that *is* a statement about brightness:
+    the colour input is a Multiply, one side folds to a constant and the other
+    does not, and the constant is grey. `M_HU_Deco_SM_CitySign03b` is
+    `Constant(0.1) * TextureSample(T_HU_Base_BSP_Concrete01)`; SpeedTree's bark
+    master is `Desaturation(Diffuse, 0.35) * Constant(0.5)`. Over the same map
+    set this returns 0.1 to 0.86 and nothing between 0 and 0.1.
+
+    A *coloured* constant is refused rather than averaged: that is a tint, and
+    `diffuse_tint` is what reads those.
+    """
+    if ref is None or ref.is_null:
+        return None
+    owner, export = index.resolve(pkg, ref)
+    if export is None or owner.class_name_of(export) != "MaterialExpressionMultiply":
+        return None
+    props, start, _end = read_object_properties(owner, export)
+    if start is None:
+        return None
+    params = params or Parameters()
+    a = _input(owner, index, props, "A", params, MAX_DEPTH)
+    b = _input(owner, index, props, "B", params, MAX_DEPTH)
+    if (a is None) == (b is None):
+        # Both fold, so there is no texture here and `constant_colour` has the
+        # whole answer; or neither does, and there is no constant to take.
+        return None
+    value = a if a is not None else b
+    if max(value[:3]) - min(value[:3]) > 1e-6:
+        return None
+    return value[0]
+
+
 def constant_scale(pkg, index, ref, params=None, depth=MAX_DEPTH):
     """The product of the constant factors multiplying into an expression.
 

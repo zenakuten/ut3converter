@@ -744,6 +744,55 @@ def main(path):
                both and "Specular" in both[0] and "SelfIllumination" not in both[0],
                str(sorted(both[0])) if both else "none")
 
+    print("a scalar brightness on the diffuse")
+    # UT3 reuses one texture at two brightnesses rather than authoring a second.
+    # M_HU_Deco_SM_CitySign03b backs its sign with T_HU_Base_BSP_Concrete01 --
+    # the same concrete the walls use -- at Constant(0.1). Drawn at 1.0 the
+    # board is a white slab, which is StaticMeshActor_2017 and _462.
+    from ut3.objects.material import diffuse_scale
+
+    def scale_of(name):
+        found = p.find(name)
+        return found and diffuse_scale(p, index, p.ref(found[0].index))
+
+    check("a sign board states its brightness as a constant",
+          round(scale_of("M_HU_Deco_SM_CitySign03b"), 3), 0.1)
+    # SpeedTree's masters are the same shape the other way up: the constant is
+    # on B and the texture chain on A.
+    check("either side of the Multiply counts",
+          round(scale_of("__SpeedTree_Bark_Master__"), 3), 0.5)
+    # A material whose texture is already dark states nothing, and must not be
+    # dimmed a second time.
+    check("a material that scales nothing reads none",
+          scale_of("M_HU_Deco_SM_CitySign01b"), None)
+    # Only the narrow `Constant * Texture` shape. constant_scale would descend
+    # the whole product and return numbers no surface could be drawn at -- it
+    # gives 133 materials across the map set a factor under 0.01.
+    check("and a boost is refused, since a ColorModifier cannot express one",
+          scale_of("M_HU_Deco_SM_CitySignStores"), None)
+
+    # The tint goes *under* the Shader when the material also glows, because a
+    # ColorModifier wrapping the Shader reaches the specular stage too
+    # (D3D9MaterialState.cpp:1188) and would dim the glow by the same factor as
+    # the board it sits on.
+    boards = TextureSet("HeatRayTex")
+    board = p.find("M_HU_Deco_SM_CitySign03b")
+    boards.add_material(p, index, p.ref(board[0].index))
+    for texture_name in list(boards.textures):
+        boards.alpha_channel[texture_name] = False
+    boards.build_materials(index)
+    kinds = dict((kind, dict(props))
+                 for kind, props in boards.materials.definitions.values())
+    check_that("the board is dimmed to 89 of 255",
+               kinds.get("ColorModifier", {}).get("Color") == "(R=89,G=89,B=89,A=255)",
+               str(kinds.get("ColorModifier", {}).get("Color")))
+    check_that("and it is the Shader's Diffuse, not a wrapper round it",
+               kinds.get("Shader", {}).get("Diffuse", "").startswith("ColorModifier'"),
+               str(kinds.get("Shader", {}).get("Diffuse")))
+    check_that("so the glow stays at full brightness",
+               kinds.get("Shader", {}).get("Specular", "").startswith("Texture'"),
+               str(kinds.get("Shader", {}).get("Specular")))
+
     print("generated UE2 materials (Phase 14)")
     from convert.shaders import FRAME_BUFFER_BLENDING
     from ut2.materials import MaterialSet

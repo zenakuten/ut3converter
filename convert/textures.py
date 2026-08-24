@@ -333,7 +333,8 @@ class TextureSet:
         if self.materials is None or key in self.pending:
             return
         from convert.shaders import surface_style
-        from ut3.objects.material import (constant_colour, diffuse_tint, opacity_scale,
+        from ut3.objects.material import (constant_colour, diffuse_scale,
+                                          diffuse_tint, opacity_scale,
                                           resolve_emissive)
 
         blend, unlit, _two_sided = surface_style(pkg, index, ref)
@@ -346,9 +347,12 @@ class TextureSet:
             elif not unlit:
                 # An opaque, lit surface still has something to say if it
                 # multiplies its texture by a constant -- 14 of BL-Dekk's 31
-                # material instances do, and two of them by a long way.
+                # material instances do, and two of them by a long way. A plain
+                # scalar brightness counts as much as a coloured tint: HeatRay's
+                # sign boards state theirs that way and nothing else.
                 if not (texture_name and constant_colour(pkg, index, ref) is None
-                        and diffuse_tint(pkg, index, ref)):
+                        and (diffuse_tint(pkg, index, ref)
+                             or diffuse_scale(pkg, index, ref))):
                     return
         # A material UT3 draws at zero opacity draws nothing, and the only
         # honest conversion is nothing. DM-HeatRay's

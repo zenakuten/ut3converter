@@ -79,8 +79,8 @@ non-opaque blend mode, and no DiffuseColor input at all:
   VectorParameter and whose alpha is DepthBiasedAlpha -- are skipped.
 """
 
-from ut3.objects.material import (MASKED_BLEND, constant_colour, diffuse_tint,
-                                  material_panner, opacity_scale)
+from ut3.objects.material import (MASKED_BLEND, constant_colour, diffuse_scale,
+                                  diffuse_tint, material_panner, opacity_scale)
 from ut3.props import read_object_properties
 
 # Blend modes that, combined with unlit shading, mark a volumetric effect.
@@ -476,6 +476,25 @@ def build_material(material_set, texture_set, pkg, index, ref,
         # which needs no texture in it, and on DM-Deck every material with a
         # tint also folds -- applying both would square the colour.
         colour = diffuse_tint(pkg, index, ref)
+    if framebuffer is None and texture_path is not None:
+        # And a plain scalar brightness on top of whatever tint there was. Only
+        # for an opaque surface: everything with a framebuffer blend already
+        # takes its level from `opacity_scale` below, and the two would compound.
+        # HeatRay's StaticMeshActor_2017 is the case this exists for -- a sign
+        # backed with the wall concrete at Constant(0.1), drawn at 1.0 as a white
+        # slab. See ut3.objects.material.diffuse_scale.
+        tone = diffuse_scale(pkg, index, ref)
+        if tone is not None:
+            from ut3.objects.graph import to_color
+
+            # Through sRGB, the same way diffuse_tint converts a parameter: UE3
+            # multiplies in linear space and UE2's ColorModifier in display
+            # space, so 0.1 is a factor of 89/255, not 26/255.
+            factor = to_color((tone, tone, tone))[0] / 255.0
+            base = colour or (255, 255, 255)
+            dimmed = tuple(max(0, min(255, int(round(c * factor)))) for c in base)
+            if dimmed != (0, 0, 0):
+                colour = dimmed
     panner = material_panner(pkg, index, ref)
     scale = opacity_scale(pkg, index, ref) if framebuffer else 1.0
 
@@ -505,6 +524,26 @@ def build_material(material_set, texture_set, pkg, index, ref,
                 ("PanRate", "%f" % rate),
             ])
             kind, current = "TexPanner", material_set.bare_path(inner)
+        if (framebuffer is None and glow_path is not None
+                and colour is not None and colour != (255, 255, 255)):
+            # The tint belongs to the diffuse alone, so it has to go *under* the
+            # Shader rather than around it. A ColorModifier wrapping the whole
+            # Shader reaches the specular stage too -- the base modifier is
+            # copied into `SpecularModifierInfo` and applied there
+            # (D3D9MaterialState.cpp:1171, :1188) -- and dimming the glow by the
+            # same factor as the board it sits on is the opposite of what UT3
+            # does: `M_HU_Deco_SM_CitySign03b` states 0.1 on its DiffuseColor
+            # and 1.0 on its emissive. Only the opaque glowing case moves; where
+            # there is a framebuffer blend the ColorModifier's *alpha* is what
+            # drives it, and that only works from outside.
+            inner = material_set.add("ColorModifier", base_name, [
+                ("Material", "%s'%s'" % (kind, current)),
+                ("Color", _color(colour)),
+                ("AlphaBlend", "False"),
+                ("RenderTwoSided", "False"),
+            ])
+            kind, current = "ColorModifier", material_set.bare_path(inner)
+            colour = None
         if unlit or glow_path is not None:
             # Two different things, one object, and they compose. Unlit: UE3
             # says the lighting pass must not touch this, and UE2 has no such

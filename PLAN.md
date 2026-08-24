@@ -1901,6 +1901,93 @@ Rebuilt: DMHeatRayTex now has 25 Shaders, 15 with a Specular glow and 10 with
 the unlit trick; DMDeckTex has 18, 9 and 10 (the sky being both). No
 `SelfIlluminationMask` is written anywhere.
 
+**Phase 22 -- a brightness stated as a bare constant.** Reported from
+DM-HeatRay: `StaticMeshActor_2017` and `StaticMeshActor_462` "look like white
+texture". They are city signs, and the texture was not wrong -- their boards
+really are painted with `T_HU_Base_BSP_Concrete01`, the same concrete the walls
+use. What was missing is the `Constant(0.1)` UT3 multiplies it by:
+
+    M_HU_Deco_SM_CitySign03b.DiffuseColor
+        = Multiply( Constant(0.1), TextureSample(T_HU_Base_BSP_Concrete01) )
+
+Reusing one texture at two brightnesses instead of authoring a second is a
+common UE3 economy, and drawn at 1.0 the board is a white slab behind the sign.
+
+`diffuse_tint` reads a *vector parameter* an instance overrides; nothing read a
+plain scalar the material multiplies in. `diffuse_scale` does now, and it goes
+through `to_color` the same way, so 0.1 becomes a ColorModifier at 89 of 255
+rather than 26 -- UE3 multiplies in linear space and UE2's ColorModifier in
+display space.
+
+*How narrow the rule had to be.* The obvious move is `graph.constant_scale`,
+which already extracts "the level" from an opacity chain. Measured on colour
+inputs it is unusable: it descends the whole Multiply tree and multiplies every
+constant it meets, so factors buried in a fresnel or detail branch come back as
+brightness. Over the map set it returns a value under 0.01 for **133**
+materials and something other than 1.0 for **1,778**.
+
+`graph.product_factor` takes one shape only -- the colour input is a Multiply,
+one side folds to a constant and the other does not, and the constant is grey.
+That is the shape that *is* a statement about brightness:
+
+    M_HU_Deco_SM_CitySign03b       Constant(0.1) * TextureSample
+    __SpeedTree_Bark_Master__      Desaturation(Diffuse, 0.35) * Constant(0.5)
+
+Over the same map set it returns 0.1 to 0.86 and nothing in between 0 and 0.1.
+A *coloured* constant is refused rather than averaged, because that is a tint
+and `diffuse_tint` is what reads those; a value above 1 is refused because a
+ColorModifier multiplies by a byte and cannot express a boost; zero is refused
+for the reason `diffuse_tint` refuses black -- DM-Deck's teleporter fingers fold
+to it through a mask this cannot follow.
+
+**159 materials across 63 maps** gain a brightness, and the list reads like the
+rule working: `M_HU_Base_BSP_Wires_Black` at 0.2 off grey marble,
+`M_UN_Sky_SM_Dome01b_Rainy` at 0.02, `M_NightSky_INST` at 0.2, Gears'
+`RatBloodPool_Mat` at 0.2 off a splatter texture, EdenInc's Chinese lanterns at
+0.1, every SpeedTree master at 0.5 or 0.3. `convert/textures.py`'s keep-gate for
+an opaque lit surface now counts a scale as much as a tint, which is what lets
+DM-Deck's `M_UN_Terrain_Dirt_04` reach the map at all.
+
+*Where the ColorModifier goes.* Under the Shader, not around it, when the
+material also glows. A ColorModifier wrapping the whole Shader reaches the
+specular stage too -- the base modifier is copied into `SpecularModifierInfo`
+and applied there (D3D9MaterialState.cpp:1171, :1188) -- and dimming the glow by
+the same factor as the board it sits on is the opposite of what the material
+says: 0.1 on DiffuseColor, 1.0 on the emissive. So:
+
+    Begin Object Class=ColorModifier Name=T_HU_Base_BSP_Concrete01_313dCM
+        Material=Texture'...T_HU_Base_BSP_Concrete01_313d'
+        Color=(R=89,G=89,B=89,A=255)
+    End Object
+    Begin Object Class=Shader Name=T_HU_Base_BSP_Concrete01_313dSH
+        Diffuse=ColorModifier'...T_HU_Base_BSP_Concrete01_313dCM'
+        Specular=Texture'...T_HU_Deco_SM_CitySign03_Phase_Glow_313d'
+    End Object
+
+Only the opaque glowing case moves inside. Where there is a framebuffer blend
+the ColorModifier's *alpha* is what drives it, and that only works from outside.
+
+*Found on the same signs, not fixed.* Two things, and they have to be done
+together or the signs get worse:
+
+- `resolve_emissive` picks `T_HU_Deco_SM_CitySign03_Phase` over
+  `T_HU_Deco_SM_CitySign03_E`, on the name scoring alone (`_e` costs 20,
+  "Phase" costs nothing). It is the wrong texture: the emissive samples `_E`,
+  and `_Phase` feeds `Sine(Time + Phase)` and `Floor(Phase)` -- per-region
+  blink *control data*, not art. Same family as Phase 19 and 20, one input
+  further along.
+- The emissive is `_E * Constant(8.0)`, and `_E` is sparse (mean luminance 13.7
+  of 255). Fixing the first without the second draws the sign's letters at an
+  eighth of the brightness UT3 gives them; `_Phase` is currently standing in for
+  the boost by accident, being a solid bright face at mean 94.
+  `..._CitySignStores` wants 5.0 the same way.
+
+  A ColorModifier cannot brighten. The place a boost *can* live is the exported
+  glow texture: `..._Glow` is generated for this purpose already and re-encoded
+  on the way out, so multiplying its RGB by the emissive's constant factor and
+  clamping would carry it. That is the fix, and it wants measuring across the
+  map set before it ships.
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes
