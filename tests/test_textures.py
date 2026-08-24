@@ -793,6 +793,80 @@ def main(path):
                kinds.get("Shader", {}).get("Specular", "").startswith("Texture'"),
                str(kinds.get("Shader", {}).get("Specular")))
 
+    print("which texture a material glows with, and how brightly")
+    from ut3.objects.material import emissive_gain, resolve_emissive, score_emissive_name
+
+    glows = TextureSet("HeatRayTex")
+
+    def glow_of(name):
+        found = p.find(name)
+        if not found:
+            return None, None
+        ref = p.ref(found[0].index)
+        owner, tex = resolve_emissive(p, index, ref, reject=glows._unusable_glow)
+        if tex is None:
+            return None, None
+        return tex.name, glows._glow_gain(p, index, ref, owner, tex)
+
+    # `_e` and "emis" are marked down by score_texture_name as evidence a
+    # texture is not the diffuse -- which is the strongest possible evidence it
+    # *is* the emissive. Left as penalties they lose to any unremarkable name in
+    # the same graph: M_HU_Deco_SM_CitySign03b reaches _E (20) and _Phase (0),
+    # and the sign glowed with the Phase texture. That is not art at all -- it
+    # feeds Sine(Time + Phase) and Floor(Phase), the per-region blink control.
+    check("a glow named _E outranks an unremarkable name",
+          score_emissive_name("T_HU_Deco_SM_CitySign03_E"),
+          score_texture_name("T_Something_D"))
+    check("while the diffuse rule marks the same name down",
+          score_texture_name("T_HU_Deco_SM_CitySign03_E"), 20)
+    check("a sign glows with its emissive, not its blink control",
+          glow_of("M_HU_Deco_SM_CitySign03b")[0], "T_HU_Deco_SM_CitySign03_E")
+
+    # And `reject` is applied before the best is chosen rather than after.
+    # Rejecting the winner used to return nothing at all instead of falling
+    # through to the candidate behind it, which cost CTF-Strident's
+    # M_LT_Mech_SM_Megawalls01 its glow the moment _E names started winning.
+    # Over the map set the two changes together lose no glow and add 67.
+    check("a sign with a dark board still finds its own",
+          glow_of("M_HU_Deco_SM_CitySign01b")[0], "T_HU_Deco_SM_CitySign01b_E")
+
+    # UE3 states the strength as a constant beside the texture, and it is large.
+    # T_HU_Deco_SM_CitySign03_E has a mean luminance of 6.75 of 255, so at 1.0
+    # the letters barely register; a ColorModifier cannot brighten, so the boost
+    # is carried in the exported glow texture instead.
+    for name, want in (("M_HU_Deco_SM_CitySign03b", 8.0),
+                       ("M_HU_Deco_SM_CitySign05b", 4.0),
+                       ("M_HU_Deco_SM_CitySign01b", 10.0),
+                       ("M_HU_Deco_SM_CitySignsTexts", 15.0)):
+        check("%s glows at %gx" % (name, want), round(glow_of(name)[1], 3), want)
+    # The cap is what the texture can take, and on these four it never bites:
+    # they want 4, 8, 10 and 15 against caps of 272, 37.8, 13.1 and 16.0.
+    check_that("the cap leaves a sparse emissive alone",
+               glow_of("M_HU_Deco_SM_CitySign01b")[1]
+               == emissive_gain(p, index,
+                                p.ref(p.find("M_HU_Deco_SM_CitySign01b")[0].index),
+                                *resolve_emissive(
+                                    p, index,
+                                    p.ref(p.find("M_HU_Deco_SM_CitySign01b")[0].index),
+                                    reject=glows._unusable_glow)))
+
+    # The boost reaches the pixels: brightening happens in linear space and
+    # clamps per pixel, the way UT3's framebuffer does.
+    from convert.textures import bake_self_alpha
+    from ut2 import dxt
+
+    flat = dxt.encode_dxt1_rgb([(20, 20, 20)] * 16, 4, 4)
+    _fmt, plain, _d = bake_self_alpha("PF_DXT1", flat, 4, 4)
+    _fmt, bright, _d = bake_self_alpha("PF_DXT1", flat, 4, 4, 8.0)
+    check_that("a boosted glow is brighter than an unboosted one",
+               max(dxt.decode_dxt5_channel(bright, 4, 4, 1))
+               > max(dxt.decode_dxt5_channel(plain, 4, 4, 1)),
+               "%d vs %d" % (max(dxt.decode_dxt5_channel(bright, 4, 4, 1)),
+                             max(dxt.decode_dxt5_channel(plain, 4, 4, 1))))
+    _fmt, blown, _d = bake_self_alpha("PF_DXT1", flat, 4, 4, 400.0)
+    check("and it clamps rather than wrapping",
+          max(dxt.decode_dxt5_channel(blown, 4, 4, 1)), 255)
+
     print("generated UE2 materials (Phase 14)")
     from convert.shaders import FRAME_BUFFER_BLENDING
     from ut2.materials import MaterialSet

@@ -314,11 +314,15 @@ def is_effect_material(props):
             and str(props.get("BlendMode", "BLEND_Opaque")) in EFFECT_BLENDS)
 
 
-def _rescored(name, table):
+def _rescored(name, table, suffixes=None):
+    """score_texture_name with some of its penalties restated for a context."""
     score = score_texture_name(name)
     if score >= DISQUALIFIED:
         return score
     low = name.lower()
+    for token, penalty in _SUFFIX_PENALTY:
+        if suffixes and token in suffixes and low.endswith(token):
+            score += suffixes[token] - penalty
     for token, penalty in _WORD_PENALTY:
         if token in low and token in table:
             score += table[token] - penalty
@@ -333,6 +337,23 @@ def score_effect_name(name):
 def score_opacity_name(name):
     """score_effect_name, for a texture reached down an opacity input."""
     return _rescored(name, _OPACITY_WORDS)
+
+
+# `_e` and "emis" are marked down by `score_texture_name` as evidence a texture
+# is not the diffuse. That is right, and it is also the strongest possible
+# evidence that it *is* the emissive, which is what resolve_emissive is looking
+# for. Left as penalties they lose to any unremarkable name in the same graph:
+# HeatRay's `M_HU_Deco_SM_CitySign03b` reaches `T_HU_Deco_SM_CitySign03_E` (20)
+# and `T_HU_Deco_SM_CitySign03_Phase` (0), and the sign was drawn glowing with
+# the Phase texture -- which is not art at all. It feeds `Sine(Time + Phase)`
+# and `Floor(Phase)`, the per-region blink control.
+_EMISSIVE_WORDS = {"emis": -20}
+_EMISSIVE_SUFFIXES = {"_e": -20}
+
+
+def score_emissive_name(name):
+    """Lower is better: how likely this name is what a material glows with."""
+    return _rescored(name, _EMISSIVE_WORDS, _EMISSIVE_SUFFIXES)
 
 
 def _stem(name):
@@ -1064,18 +1085,62 @@ def resolve_emissive(pkg, index, ref, reject=None):
     expr_owner, expr_export = index.resolve(owner, expr)
     if expr_export is None:
         return None, None
-    found_owner, found, _sample = _walk(expr_owner, index, expr_export, 12, set(),
-                                        None, None, params)
-    if found is None:
+    # Collected rather than walked, so that `reject` can be applied *before* the
+    # best is chosen instead of after. `_walk` returns one candidate and the
+    # caller could only throw it away, which cost two materials their glow the
+    # moment score_emissive_name started preferring `_E` names: CTF-Strident's
+    # `M_LT_Mech_SM_Megawalls01` reaches a featureless `..._E` and a usable
+    # `..._EPan`, and rejecting the winner returned nothing at all rather than
+    # falling through to the one behind it.
+    candidates = []
+    _collect(expr_owner, index, expr_export, 12, set(), candidates, params)
+    usable = [entry for entry in candidates
+              if reject is None or not reject(entry[0], entry[1])]
+    if not usable:
         return None, None
-    if reject is not None and reject(found_owner, found):
-        return None, None
+    found_owner, found, _sample = min(
+        usable, key=lambda entry: score_emissive_name(entry[1].name))
 
     diffuse_owner, diffuse = resolve_diffuse(pkg, index, ref)
     if diffuse is not None and diffuse_owner is found_owner \
             and diffuse.index == found.index:
         return None, None
     return found_owner, found
+
+
+def emissive_gain(pkg, index, ref, glow_owner, glow_export):
+    """How much brighter than its texture a material's glow is drawn. >= 1.0.
+
+    A ColorModifier multiplies by a byte and cannot brighten, so a boost has
+    nowhere to live in the material -- but the glow copy of the texture is
+    generated for this purpose alone and re-encoded on the way out, so it can
+    carry it. See `graph.sample_gain` for why the walk goes to the sample rather
+    than reading the input as a whole, and `convert/textures.py:bake_self_alpha`
+    for where the factor is applied.
+
+    1.0 when the material does not scale its emissive, and never below: a glow
+    dimmer than its texture is expressible as a ColorModifier and is not this
+    function's business.
+    """
+    from . import graph as G
+
+    owner, _base, props = base_material(pkg, index, ref)
+    if props is None:
+        return 1.0
+    expr = _expression_ref(props.get("EmissiveColor"))
+    if expr is None or expr.is_null:
+        return 1.0
+
+    def is_target(sample_pkg, sample_export):
+        tex_owner, tex = _texture_of(sample_pkg, index, sample_export)
+        return (tex is not None and tex_owner is glow_owner
+                and tex.index == glow_export.index)
+
+    gain = G.sample_gain(owner, index, expr, is_target,
+                         G.collect_parameters(pkg, index, ref))
+    if gain is None or gain <= 1.0:
+        return 1.0
+    return gain
 
 
 # Vector parameters that tint the diffuse map rather than replacing it. Matched

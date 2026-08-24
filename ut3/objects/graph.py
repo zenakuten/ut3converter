@@ -514,6 +514,96 @@ _SPINE = {
 }
 
 
+def sample_gain(pkg, index, ref, is_target, params=None, depth=MAX_DEPTH):
+    """The constant factor multiplying a chosen sample on its way to this input.
+
+    `is_target(package, export)` says whether an expression is the sample being
+    asked about. Returns None when it is not reachable, 1.0 when nothing scales
+    it.
+
+    UE3 states an emissive's strength as a plain constant multiplied in beside
+    the texture, and it is routinely large: HeatRay's `M_HU_Deco_SM_CitySign03b`
+    is `_E * Constant(8.0) * <blink>`, `..._CitySignsTexts` wants 5.0. The
+    texture alone is not what UT3 draws -- `T_HU_Deco_SM_CitySign03_E` has a
+    mean luminance of 13.7 of 255, so at 1.0 the sign's letters barely register.
+
+    Neither `constant_scale` nor `product_factor` finds it. The first stops at
+    the first node that is not a Multiply, and the 8.0 here sits under a
+    Desaturation; the second only looks at the top. This walks *to the sample*
+    and multiplies in what each Multiply on the path holds on its other side,
+    which is the only reading of "how much is this texture scaled by" that does
+    not depend on where in the graph the constant happens to sit.
+    """
+    if depth <= 0 or ref is None or ref.is_null:
+        return None
+    owner, export = index.resolve(pkg, ref)
+    if export is None:
+        return None
+    return _gain_to(owner, index, export, is_target, params or Parameters(), depth)
+
+
+def _gain_to(pkg, index, export, is_target, params, depth):
+    if depth <= 0:
+        return None
+    if is_target(pkg, export):
+        return 1.0
+    props, start, _end = read_object_properties(pkg, export)
+    if start is None:
+        return None
+    cls = pkg.class_name_of(export)
+    inputs = []
+    for name, _i, _t, value in props.items:
+        ref = _expression(value)
+        if ref is None or ref.is_null:
+            continue
+        owner, sub = index.resolve(pkg, ref)
+        if sub is not None:
+            inputs.append((name, owner, sub))
+    if cls == "MaterialExpressionStaticSwitchParameter":
+        switch = str(props.get("ParameterName", ""))
+        on = params.switches.get(switch)
+        if on is None:
+            on = props.get("DefaultValue") is True
+        live = "A" if on else "B"
+        inputs = [entry for entry in inputs if entry[0] == live]
+    for name, owner, sub in inputs:
+        gain = _gain_to(owner, index, sub, is_target, params, depth - 1)
+        if gain is None:
+            continue
+        if cls == "MaterialExpressionMultiply" and name in ("A", "B"):
+            other = "B" if name == "A" else "A"
+            gain *= _side_factor(pkg, index, props, other, params)
+        return gain
+    return None
+
+
+def _side_factor(pkg, index, props, key, params):
+    """What the other side of a Multiply scales the sample by. 1.0 if unclear.
+
+    Two shapes only, and `constant_scale` is deliberately not one of them. It
+    descends the whole sub-tree and multiplies every constant it meets, which
+    on an emissive chain compounds into numbers that are plainly not brightness:
+    `M_HU_Deco_SM_StopLight01_Complex` came out at 62,500 and
+    `M_LT_Mech_SM_Platform01_Red_Master` at 102,400 -- squares of constants used
+    for something else entirely.
+
+    So: the side is a constant, or it is a Multiply with a constant on one side
+    -- `Constant(8.0) * Clamp(<blink>)`, which is how HeatRay's signs state a
+    boost, the Clamp being a 0..1 animation that folds to nothing and leaves the
+    8.0 as the peak. Anything else contributes nothing.
+    """
+    ref = _expression(props.get(key))
+    if ref is None or ref.is_null:
+        return 1.0
+    whole = fold(pkg, index, ref, params)
+    if whole is not None:
+        if max(whole[:3]) - min(whole[:3]) > 1e-6:
+            return 1.0
+        return whole[0]
+    inner = product_factor(pkg, index, ref, params)
+    return 1.0 if inner is None else inner
+
+
 def product_factor(pkg, index, ref, params=None):
     """The constant one side of a top-level Multiply contributes, or None.
 

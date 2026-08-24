@@ -169,6 +169,11 @@ class TextureSet:
         self.invisible = []
         # texture names exported as a glow: alpha baked from their own luminance
         self.glow = set()
+        # glow name -> how much brighter than its texture the material draws it,
+        # already capped against what the texture can take. See bake_self_alpha.
+        self.gain = {}
+        # names that really were brightened, for reporting
+        self.boosted = []
         # texture name -> (channel, colour one, colour two) for a two-tone
         # material, recoloured on the way out
         self.blend = {}
@@ -282,7 +287,8 @@ class TextureSet:
         self._note_material(key, name, pkg, index, ref)
         return name
 
-    def add_texture(self, owner, export, albedo=None, glow=False, blend=None):
+    def add_texture(self, owner, export, albedo=None, glow=False, blend=None,
+                    gain=1.0):
         """Register one Texture2D; returns (name, was already registered).
 
         Two materials often share one texture, and a glow shares one with
@@ -292,12 +298,15 @@ class TextureSet:
 
         `glow` is part of the key for the same reason: a glow copy carries an
         alpha channel baked from its own luminance (see bake_self_alpha), and
-        the same texture drawn as an ordinary diffuse must not.
+        the same texture drawn as an ordinary diffuse must not. So is `gain`:
+        UT3's stop lights draw one emissive at 250 times its texture and its
+        signs at 8, and two brightnesses of one glow are two UT2004 textures.
         """
         for name, (existing_pkg, existing) in self.textures.items():
             if existing_pkg is owner and existing.index == export.index \
                     and self.albedo.get(name) == albedo \
                     and self.blend.get(name) == blend \
+                    and abs(self.gain.get(name, 1.0) - gain) < 1e-6 \
                     and (name in self.glow) == glow:
                 return name, True
         suffix = "_Glow" if glow else ("_2T" if blend else "")
@@ -310,6 +319,8 @@ class TextureSet:
         if glow:
             self.glow.add(name)
             self.needs_alpha[name] = True
+            if gain > 1.0:
+                self.gain[name] = gain
         if blend is not None:
             self.blend[name] = blend
         return name, False
@@ -343,7 +354,9 @@ class TextureSet:
             glow_owner, glow_export = resolve_emissive(pkg, index, ref,
                                                        reject=self._unusable_glow)
             if glow_export is not None:
-                glow, _existed = self.add_texture(glow_owner, glow_export, glow=True)
+                glow, _existed = self.add_texture(
+                    glow_owner, glow_export, glow=True,
+                    gain=self._glow_gain(pkg, index, ref, glow_owner, glow_export))
             elif not unlit:
                 # An opaque, lit surface still has something to say if it
                 # multiplies its texture by a constant -- 14 of BL-Dekk's 31
@@ -438,6 +451,39 @@ class TextureSet:
         name = self.name_for(ref)
         return "Texture'%s'" % name if name else None
 
+
+    @classmethod
+    def _glow_gain(cls, pkg, index, ref, owner, export):
+        """How far to brighten a glow texture, capped at what it can take.
+
+        The material's own factor comes from `emissive_gain` and is often large:
+        HeatRay's signs state 4, 8, 10 and 15, and UT3's stop lights 250. Applied
+        whole it is right for a sparse emissive and wrong for a dense one, which
+        simply goes white -- and the texture selection is not always perfect, so
+        a 400 landing on a cloud texture would paint the sky.
+
+        The cap is the factor that brings the texture to full brightness *on
+        average*. Past that UT3 is relying on a bloom pass that has no UE2
+        counterpart, and all a larger number can do here is erase detail. It
+        costs nothing in practice: the four HeatRay signs want 4, 8, 10 and 15
+        against caps of 272, 37.8, 13.1 and 16.0, so every one is applied whole.
+        """
+        from ut3.objects.material import emissive_gain
+
+        gain = emissive_gain(pkg, index, ref, owner, export)
+        if gain <= 1.0:
+            return 1.0
+        channels = cls._decode_smallest(owner, export)
+        if channels is None:
+            return 1.0
+        n = min(len(c) for c in channels)
+        if not n:
+            return 1.0
+        mean = sum(0.299 * channels[0][i] + 0.587 * channels[1][i]
+                   + 0.114 * channels[2][i] for i in range(n)) / n
+        if mean <= 0.0:
+            return 1.0
+        return min(gain, 255.0 / mean)
 
     def _unusable_glow(self, owner, export):
         """Can this texture not serve as a glow?
@@ -746,8 +792,14 @@ def _srgb(value):
     return linear_to_srgb(value)
 
 
-def bake_self_alpha(fmt, data, width, height):
+def bake_self_alpha(fmt, data, width, height, gain=1.0):
     """Put a texture's own luminance in its alpha. Returns (fmt, data, done).
+
+    `gain` brightens the colour first -- see `TextureSet._glow_gain`. UE3 states
+    an emissive's strength as a constant beside the texture and a ColorModifier
+    cannot brighten, so this is the one place a boost can be carried. The
+    multiply is in linear space, which is where UE3 does it; clamping per pixel
+    is what UT3's framebuffer does too, minus the bloom.
 
     Written for `Shader.SelfIllumination` + `SelfIlluminationMask`, which is how
     the glow used to be drawn: the engine reads the mask's alpha and *lerps*
@@ -782,9 +834,21 @@ def bake_self_alpha(fmt, data, width, height):
     if not channels or not channels[0]:
         return fmt, data, False
     n = min(len(c) for c in channels)
+    if gain > 1.0:
+        channels = [[max(0, min(255, int(round(
+            _srgb(_linear(channels[c][i] / 255.0) * gain) * 255.0))))
+            for i in range(n)] for c in range(3)]
     # Rec. 601 luma: a glow reads by brightness, and green carries most of it.
     values = [min(255, int(0.299 * channels[0][i] + 0.587 * channels[1][i]
                            + 0.114 * channels[2][i])) for i in range(n)]
+    if gain > 1.0 and fmt != "PF_A8R8G8B8":
+        # The colour has changed, so the blocks have to be built again rather
+        # than copied through. DXT5's colour half is DXT1's layout exactly, so
+        # one encode serves every compressed source format.
+        pixels = [(channels[0][i], channels[1][i], channels[2][i])
+                  for i in range(n)]
+        colour = dxt.encode_dxt1_rgb(pixels, width, height)
+        return "PF_DXT5", dxt.dxt1_with_alpha(colour, values, width, height), True
     if fmt == "PF_DXT1":
         return "PF_DXT5", dxt.dxt1_with_alpha(data, values, width, height), True
     if fmt in ("PF_DXT3", "PF_DXT5"):
@@ -795,6 +859,9 @@ def bake_self_alpha(fmt, data, width, height):
             at = i * 4 + 3
             if at < len(out):
                 out[at] = value
+                if gain > 1.0:
+                    for c in range(3):
+                        out[i * 4 + 2 - c] = channels[c][i]
         return fmt, bytes(out), True
     return fmt, data, False
 
@@ -931,15 +998,21 @@ def export_textures(texture_set, out_dir, index, max_size=DEFAULT_MAX_SIZE, grou
             glow_chain = []
             baked = False
             source_fmt = fmt
+            # One gain for the whole chain, measured on the texture rather than
+            # on each mip: a per-level factor would make the glow change
+            # brightness with distance.
+            gain = texture_set.gain.get(name, 1.0)
             for level_width, level_height, level in chain:
                 level_fmt, level, done = bake_self_alpha(
-                    source_fmt, level, level_width, level_height)
+                    source_fmt, level, level_width, level_height, gain)
                 baked = baked or done
                 glow_chain.append((level_width, level_height, level))
                 fmt = level_fmt
             if baked:
                 chain = glow_chain
                 data = chain[0][2]
+                if gain > 1.0:
+                    texture_set.boosted.append(name)
             else:
                 texture_set.glow.discard(name)
 

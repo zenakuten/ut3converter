@@ -1988,6 +1988,84 @@ together or the signs get worse:
   clamping would carry it. That is the fix, and it wants measuring across the
   map set before it ships.
 
+**Phase 23 -- what a material glows with, and how brightly.** The two things
+Phase 22 found on HeatRay's signs and left. They had to be done together: the
+first alone makes the signs dimmer, and the second alone brightens the wrong
+texture.
+
+*Which texture.* `resolve_emissive` was picking
+`T_HU_Deco_SM_CitySign03_Phase` over `..._E` on the name scoring alone --
+`score_texture_name` charges 20 for an `_e` suffix, and "Phase" costs nothing.
+`_Phase` is not art: it feeds `Sine(Time + Phase)` and `Floor(Phase)`, the
+per-region blink control. The `_e` and "emis" penalties exist as evidence a
+texture is not the *diffuse*, which is the strongest possible evidence it is the
+emissive, so `score_emissive_name` restates them as bonuses -- the same move
+Phase 20 made for "falloff" on an effect.
+
+That immediately cost two materials their glow, and the reason was a second bug
+one layer up: `resolve_emissive` asked `_walk` for one candidate and then
+applied `reject` to it, so a rejected winner returned *nothing* rather than
+falling through to the candidate behind it. CTF-Strident's
+`M_LT_Mech_SM_Megawalls01` reaches a featureless `..._E` and a usable
+`..._EPan`. Collecting the candidates and rejecting before choosing fixes it,
+and it turns out to have been suppressing a great deal: over the map set the two
+changes together **lose no glow and add 67**, on top of **337 that change
+texture**. Every one of those reads the same way --
+
+    T_UN_Team_SM_LED_Base_E2       -> T_UN_Team_SM_LED_Base_E          119
+    T_LT_Deco_SM_HoloScreen_Pan01  -> T_LT_Deco_SM_Monitors_E           74
+    T_LT_Mech_SM_Macro01           -> T_LT_Mech_SM_Megapiston01_E       24
+    T_ASC_Light_SM_GLight_Flicker  -> T_LT_Mech_SM_Megaring01_E         22
+    T_HU_Deco_SM_CitySign03_Phase  -> T_HU_Deco_SM_CitySign03_E         10
+    T_WP_Linkgun_Plasma01          -> T_CH_Mining_Bot_E                  6
+
+-- a generic FX, flicker or control texture giving way to the asset's own
+emissive.
+
+*How brightly.* UE3 states the strength as a plain constant beside the texture
+and it is large: `M_HU_Deco_SM_CitySign03b` is `_E * Constant(8.0) * <blink>`,
+`..._05b` 4, `..._01b` 10, and `..._CitySignsTexts` **15** -- the number this
+file's own Phase 14 notes recorded by eye. The textures are authored for it:
+`T_HU_Deco_SM_CitySign03_E` has a mean luminance of 6.75 of 255, so at 1.0 the
+letters do not register.
+
+Neither `constant_scale` nor `product_factor` finds it -- the first stops at the
+first node that is not a Multiply and the 8.0 sits under a Desaturation, the
+second only looks at the top. `graph.sample_gain` walks *to the sample* and
+multiplies in what each Multiply on the path holds on its other side.
+`_side_factor` decides what a side contributes, and it is deliberately not
+`constant_scale`: that compounds into numbers that are plainly not brightness --
+`M_HU_Deco_SM_StopLight01_Complex` came out at **62,500** and
+`M_LT_Mech_SM_Platform01_Red_Master` at **102,400**, squares of constants used
+for something else. A side counts when it is a constant, or a Multiply with a
+constant on one side (`Constant(8.0) * Clamp(<blink>)`, the Clamp being a 0..1
+animation that folds to nothing and leaves the 8.0 as the peak).
+
+*Where the boost lives.* A ColorModifier multiplies by a byte and cannot
+brighten, so there is nowhere in the material to put it -- but the `..._Glow`
+copy of the texture is generated for this purpose alone and re-encoded on the
+way out. `bake_self_alpha` takes a `gain` and multiplies the colour in linear
+space, clamping per pixel, which is what UT3's framebuffer does minus the bloom.
+The gain joins `albedo`, `blend` and `glow` in `add_texture`'s key, since UT3
+draws one emissive at 250 and another at 8.
+
+*The cap, and why there is one.* `TextureSet._glow_gain` limits the factor to
+the one that brings the texture to full brightness *on average*. Past that UT3
+is relying on a bloom pass with no UE2 counterpart, and all a larger number can
+do is erase detail -- and the texture choice is not always perfect, so
+`M_UN_Sky_SM_Stars01` asking for 400 on a *cloud* texture would have painted the
+sky white. It bites on 211 of 1,518 rows and leaves the signs untouched: they
+want 4, 8, 10 and 15 against caps of 272, 37.8, 13.1 and 16.0. The only factor
+above 50 that survives is UT3's traffic light at 250, whose emissive is black
+but for the lamps.
+
+Measured on the exported files:
+
+    T_HU_Deco_SM_CitySign03_E   mean  6.75 -> 28.1 at 8x    6.4% of pixels over 128
+    T_HU_Deco_SM_CitySign01b_E  mean 19.44 -> 50.4 at 10x  20.3% over 128
+
+Sparse bright letters, not a white slab.
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes
