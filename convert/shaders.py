@@ -506,26 +506,39 @@ def build_material(material_set, texture_set, pkg, index, ref,
             ])
             kind, current = "TexPanner", material_set.bare_path(inner)
         if unlit or glow_path is not None:
-            # Two different things, one object. Unlit: UE3 says the lighting
-            # pass must not touch this, and UE2 has no such flag on a Texture,
-            # so it takes the Shader that XEffectMat's goop uses -- the same
-            # material in Diffuse and SelfIllumination, with no
+            # Two different things, one object, and they compose. Unlit: UE3
+            # says the lighting pass must not touch this, and UE2 has no such
+            # flag on a Texture, so it takes the Shader that XEffectMat's goop
+            # uses -- the same material in Diffuse and SelfIllumination, with no
             # SelfIlluminationMask, leaving nothing for lighting to modulate.
-            # Glowing: the surface is lit normally and a *second* texture is
-            # added on top, which is what the two slots are for. HeatRay's city
-            # signs are the case -- painted `..._D`, glowing `..._E`.
+            # Glowing: the surface is drawn normally and a *second* texture is
+            # added on top. HeatRay's city signs are the case -- painted
+            # `..._D`, glowing `..._E`.
             shader = [("Diffuse", "%s'%s'" % (kind, current))]
             if glow_path:
-                # The mask is the glow itself, whose alpha carries its own
-                # luminance (convert/textures.py: bake_self_alpha). Setting it
-                # is not optional: SelfIllumination *without* a mask replaces
-                # the diffuse and unlits the surface entirely
-                # (D3D9MaterialState.cpp:972), which for a city sign draws its
-                # near-black `..._E` texture on its own. With the mask the
-                # engine blends the glow over the lit diffuse instead.
-                shader.append(("SelfIllumination", "Texture'%s'" % glow_path))
-                shader.append(("SelfIlluminationMask", "Texture'%s'" % glow_path))
-            else:
+                # `Specular`, not `SelfIllumination`, and the slot's name is the
+                # only thing about it that does not fit. UE3's emissive is
+                # added: `Final = Diffuse * Light + Emissive`. UE2 has exactly
+                # one operation that does that, and it is the specular pass with
+                # no SpecularityMask -- D3DTOP_ADD in one pass
+                # (D3D9MaterialState.cpp:544, HandleSpecular_SP with
+                # UseSpecularity 0), ONE/ONE in two (:1500), and GL_ADD /
+                # GL_ONE in the OpenGL driver (OpenGLMaterialState.cpp:589,
+                # :1667). `ModulateSpecular2X` defaults False, which is what
+                # keeps it an add rather than a modulate.
+                #
+                # SelfIllumination cannot express it. Without a mask it
+                # *replaces* the diffuse and unlits the surface
+                # (D3D9MaterialState.cpp:972); with one it lerps --
+                # D3DTOP_BLENDCURRENTALPHA, `glow * a + lit * (1 - a)` (:1082,
+                # :520). A lerp is not an add, and on a sign it reads as
+                # nothing happening: `M_HU_Deco_SM_CitySign01b` paints a
+                # near-black panel (mean luminance 34 of 255) and glows a bright
+                # one (max 237), and at the mask's mid-tones the lerp drew about
+                # 40 where UT3 draws 100. Reported as StaticMeshActor_641 being
+                # "ok but not glowing".
+                shader.append(("Specular", "Texture'%s'" % glow_path))
+            if unlit:
                 shader.append(("SelfIllumination", "%s'%s'" % (kind, current)))
             if framebuffer is None and blend == MASKED_BLEND:
                 # No FinalBlend will wrap this one, so the Shader's own

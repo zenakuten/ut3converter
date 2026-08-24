@@ -1838,6 +1838,69 @@ tinted one.
 grain, and the same one-texture-per-stage limit from Phase 19 applies: the
 product of two falloffs is drawn as the first of them.
 
+**Phase 21 -- a glow is added, not blended.** Reported from DM-HeatRay's
+`StaticMeshActor_641`: a city sign that "looks ok but is not glowing". The
+conversion was right on paper -- `resolve_emissive` found
+`T_HU_Deco_SM_CitySign01b_E`, the texture exported, and the actor's Shader
+named it -- so the fault was in *which slot* it named.
+
+`Shader.SelfIllumination` with a `SelfIlluminationMask` does not add anything.
+The engine loads the mask's alpha into the stage and then combines with
+`D3DTOP_BLENDCURRENTALPHA` (D3D9MaterialState.cpp:520, :1082), which is
+
+    result = glow * a + lit_diffuse * (1 - a)
+
+a lerp. UE3's emissive is `Final = Diffuse * Light + Emissive` -- an add. On a
+sign the difference is the whole effect: `M_HU_Deco_SM_CitySign01b` paints a
+near-black panel (mean luminance 34 of 255, max 53) and glows a bright one (max
+237), and at the mask's mid-tones the lerp drew about 40 where UT3 draws 100.
+Present, lit, dead.
+
+UE2 has exactly one operation that adds, and it is the specular pass with no
+`SpecularityMask`: `HandleSpecular_SP` with `UseSpecularity` 0 sets
+`ColorOp = D3DTOP_ADD` in the single-pass case (:544) and the multipass blend is
+`ONE`/`ONE` (:1500). The OpenGL driver agrees -- `GL_ADD` at
+OpenGLMaterialState.cpp:589, `GL_ONE` at :1667 -- so it is not a D3D-only trick.
+`ModulateSpecular2X` defaults False, which is what keeps it an add rather than
+a modulate. The slot's name is the only thing about it that does not fit.
+
+So a glowing material is now
+
+    Begin Object Class=Shader Name=T_HU_Deco_SM_CitySign01b_D_313dSH
+        Diffuse=Texture'...T_HU_Deco_SM_CitySign01b_D_313d'
+        Specular=Texture'...T_HU_Deco_SM_CitySign01b_E_Glow_313d'
+    End Object
+
+**1,451 opaque materials across the 157 maps** carry a glow and every one of
+them changes. Nothing else does: only `BLEND_Opaque` materials are given one,
+and the .t3d files come out byte-identical, because the actors reference the
+Shader by name and only its contents changed.
+
+*A second thing this fixed by construction.* Unlit and glowing used to be
+mutually exclusive -- the old branch was `if glow: <the glow pair> else: <the
+unlit trick>`, so a material that was both silently lost its unlit-ness. The two
+compose now: `SelfIllumination` equal to `Diffuse` unlits the surface
+(:972) and `Specular` still adds over it, the specular block having no `Unlit`
+guard. DM-Deck's sky dome is the case, and it is the only Shader in either
+rebuilt package carrying both slots:
+
+    Diffuse=Texture'DMDeckTex.BSP.T_UN_Sky_SM_Onyx_c305'
+    Specular=Texture'DMDeckTex.BSP.T_UN_Sky_SM_Sun01_Glow_c305'
+    SelfIllumination=Texture'DMDeckTex.BSP.T_UN_Sky_SM_Onyx_c305'
+
+*What `bake_self_alpha` is for now.* Nothing reads that alpha any more -- the
+specular pass takes `AlphaArg1` from CURRENT and only the texture's colour. The
+bake stays anyway, for two reasons that outlived its original one: it is the
+measurement behind `_unusable_glow`'s featureless test (the engine's placeholder
+emissive is 32x32 at mean 128 with a spread of zero), and the set of formats it
+can bake is exactly the set `_unusable_glow` accepts, so the two stay in step by
+construction. It costs a DXT5 encode where DXT1 would do, which is worth
+revisiting if package size ever matters.
+
+Rebuilt: DMHeatRayTex now has 25 Shaders, 15 with a Specular glow and 10 with
+the unlit trick; DMDeckTex has 18, 9 and 10 (the sky being both). No
+`SelfIlluminationMask` is written anywhere.
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes

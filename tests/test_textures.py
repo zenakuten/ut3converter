@@ -708,6 +708,42 @@ def main(path):
     check("an effect does not inherit a Panner from a branch UT3 drops",
           sheet and material_panner(p, index, p.ref(sheet[0].index)), None)
 
+    print("a glow is added, not blended")
+    # UE3's emissive is `Final = Diffuse * Light + Emissive`. UE2 has one
+    # operation that adds: the specular pass with no SpecularityMask
+    # (D3DTOP_ADD / ONE-ONE). SelfIllumination + mask lerps instead, and on
+    # M_HU_Deco_SM_CitySign01b -- a near-black panel with a bright glow -- the
+    # lerp drew about 40 where UT3 draws 100, which is StaticMeshActor_641
+    # looking "ok but not glowing".
+    signs = TextureSet("HeatRayTex")
+    sign_mat = p.find("M_HU_Deco_SM_CitySign01b")
+    signs.add_material(p, index, p.ref(sign_mat[0].index))
+    for texture_name in list(signs.textures):
+        signs.alpha_channel[texture_name] = False
+    signs.build_materials(index)
+    shader = [props for kind, props in signs.materials.definitions.values()
+              if kind == "Shader"]
+    check("the sign builds one Shader", len(shader), 1)
+    slots = dict(shader[0]) if shader else {}
+    check_that("with the glow in Specular",
+               "Glow" in slots.get("Specular", ""), str(slots.get("Specular")))
+    check("and nothing in SelfIllumination", slots.get("SelfIllumination"), None)
+    check("which is what stops the engine unlitting the surface",
+          slots.get("SelfIlluminationMask"), None)
+    # An unlit material that also glows needs both, and they compose: the
+    # SelfIllumination-equals-Diffuse trick unlits it, and Specular still adds.
+    from convert.shaders import build_material
+    from ut2.materials import MaterialSet as _MS
+
+    combo = _MS("Pkg", "abcd")
+    kinds = build_material(combo, signs, p, index, p.ref(sign_mat[0].index),
+                           "Pkg.BSP.Tex", "Tex", glow_path="Pkg.BSP.Glow")
+    both = [dict(props) for kind, props in combo.definitions.values()
+            if kind == "Shader"]
+    check_that("a lit glow names Specular only",
+               both and "Specular" in both[0] and "SelfIllumination" not in both[0],
+               str(sorted(both[0])) if both else "none")
+
     print("generated UE2 materials (Phase 14)")
     from convert.shaders import FRAME_BUFFER_BLENDING
     from ut2.materials import MaterialSet

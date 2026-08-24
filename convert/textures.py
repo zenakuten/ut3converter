@@ -390,10 +390,14 @@ class TextureSet:
             if glow is not None and (glow not in self.textures
                                      or glow not in self.glow):
                 # Either the texture failed to export, or its luminance could
-                # not be baked into an alpha channel. Without that alpha a
-                # SelfIllumination has no mask, and no mask means it replaces
-                # the diffuse rather than glowing over it -- so there is
-                # nothing to build and the surface keeps its flat texture.
+                # not be measured and baked. The glow is drawn by an additive
+                # specular pass, which does not read that alpha (see
+                # build_material), so the bake is no longer what makes the glow
+                # work -- but it is still the test that the texture *has*
+                # measurable luminance, and `_unusable_glow` is written against
+                # exactly the set the baker can handle. A texture that failed it
+                # is one nothing should reference, so the surface keeps its flat
+                # texture.
                 glow = None
             built, description = build_material(
                 self.materials, self, pkg, index, ref,
@@ -741,14 +745,18 @@ def _srgb(value):
 def bake_self_alpha(fmt, data, width, height):
     """Put a texture's own luminance in its alpha. Returns (fmt, data, done).
 
-    What a UT3 glow needs to become a UE2 one. `Shader.SelfIllumination` with
-    no `SelfIlluminationMask` does not add a glow at all -- it *replaces* the
-    diffuse and unlits the whole surface (D3D9MaterialState.cpp:972), which for
-    a city sign means drawing its near-black `..._E` texture on its own. With a
-    mask equal to the SelfIllumination, the engine takes the alpha channel of
-    that texture and blends the glow over the lit diffuse
-    (D3D9MaterialState.cpp:1096) -- so the alpha has to say where the glow is,
-    and for a UE3 emissive that is exactly how bright it is.
+    Written for `Shader.SelfIllumination` + `SelfIlluminationMask`, which is how
+    the glow used to be drawn: the engine reads the mask's alpha and *lerps*
+    between the lit diffuse and the glow (D3D9MaterialState.cpp:1082), so the
+    alpha had to say where the glow is -- and for a UE3 emissive that is exactly
+    how bright it is.
+
+    The glow is an additive specular pass now, which does not read this alpha at
+    all, because a lerp is not what UE3 does and on a dark sign it read as
+    nothing happening. The bake stays for two reasons that outlived it: it is
+    the measurement behind `_unusable_glow`'s featureless test, and it is what
+    decides which formats can serve as a glow at all, so the two remain in step
+    by construction.
     """
     from ut2 import dxt
 
