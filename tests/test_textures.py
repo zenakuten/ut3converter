@@ -907,8 +907,31 @@ def main(path):
     # Read out of D3D9MaterialState.cpp:299 rather than chosen: FB_Brighten is
     # SRCALPHA/ONE, FB_AlphaBlend is SRCALPHA/INVSRCALPHA, FB_Translucent is
     # ONE/INVSRCCOLOR -- keyed on brightness, not alpha.
-    check("additive maps to FB_Brighten",
-          FRAME_BUFFER_BLENDING["BLEND_Additive"], "FB_Brighten")
+    # Additive is the one entry that is a judgement rather than a translation.
+    # FB_Brighten is SRCALPHA/ONE, a true add, and UE3 does mean a true add --
+    # into a float buffer it then tonemaps. UE2 adds into eight bits and clips,
+    # so WAR-PowerSurge's light cones went white wherever two overlapped in
+    # depth, the meshes being two-sided and so stacking against themselves
+    # before any second cone was involved. FB_Translucent is ONE/INVSRCCOLOR,
+    # `src + dst * (1 - src)`: the screen operator, which saturates instead of
+    # clipping and is identical to a true add for one layer over black.
+    check("additive maps to FB_Translucent, which saturates instead of clipping",
+          FRAME_BUFFER_BLENDING["BLEND_Additive"], "FB_Translucent")
+
+    def screen(src, dst):
+        return src + dst * (1.0 - src)
+
+    def add(src, dst):
+        return src + dst
+
+    check_that("one layer over black is the same either way",
+               abs(screen(0.35, 0.0) - add(0.35, 0.0)) < 1e-9)
+    check_that("two layers saturate rather than clip",
+               abs(screen(0.35, screen(0.35, 0.0)) - 0.5775) < 1e-4,
+               "%.4f vs a clipped %.4f"
+               % (screen(0.35, screen(0.35, 0.0)), min(1.0, add(0.35, 0.35))))
+    check_that("and a third still has somewhere to go",
+               screen(0.35, screen(0.35, screen(0.35, 0.0))) < 1.0)
     check("translucent maps to FB_AlphaBlend, alpha permitting",
           FRAME_BUFFER_BLENDING["BLEND_Translucent"], "FB_AlphaBlend")
     check("modulate maps to FB_Modulate",

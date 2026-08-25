@@ -2121,6 +2121,49 @@ and `T_LT_Floors_SM_Walkpipe01_F` is no longer exported at all, nothing
 referencing it. The 80 cones keep their Skins and their FinalBlend now wraps a
 ColorModifier at (89,89,63).
 
+**Phase 25 -- additive effects stack to white, and the blend is the fix.**
+Reported on WAR-PowerSurge after Phase 24 dimmed the cones: they are still too
+bright, and the reason is that several overlapping *in depth* add together until
+the framebuffer is white.
+
+`FB_Brighten` is `SRCALPHA / ONE` (D3D9MaterialState.cpp:339) -- `dst + src`, a
+true add, which is what `BLEND_Additive` means. UE3 means it too, but it
+accumulates in a float buffer and tonemaps, so overlapping cones compress toward
+white. UE2 adds into eight bits and clips at the first crossing: two cones are
+simply white and a third contributes nothing. PowerSurge's cones are drawn
+two-sided, so each one stacks against itself before any second cone is involved.
+
+`FB_Translucent` is `ONE / INVSRCCOLOR` (:325) -- `src + dst * (1 - src)`, the
+screen operator. It is the LDR blend with the same shape as add-then-tonemap:
+
+    layers      true add         screen
+    1 over 0    0.35             0.35      identical
+    2           0.70             0.58
+    3           1.00 (clipped)   0.73
+    n           clamped          -> 1, never reached
+
+Identical for one layer over black, which is what an effect over an unlit
+background is; monotonic and saturating everywhere else. Black stays transparent
+under both -- an additive black adds nothing, a brightness-keyed black is clear
+-- so *what* is drawn does not change, only how the layers meet.
+
+`FRAME_BUFFER_BLENDING["BLEND_Additive"]` therefore maps to `FB_Translucent`,
+and it is the one entry in that table that is a judgement rather than a
+translation. 495 materials across the map set are additive, but the change is
+narrow by construction: rebuilding WAR-PowerSurge moves **no line of the .t3d**
+and exactly two lines of the generated package --
+
+    T_LT_Light_SM_LightCone_Falloff01_9871FB   FB_Brighten -> FB_Translucent
+    Tile_Fire_001_9871FB                       FB_Brighten -> FB_Translucent
+
+-- because a FinalBlend is one object however many actors wear it.
+
+One consequence worth naming: an additive material that scales its own opacity
+now takes the *colour* path in `build_material` rather than the alpha path,
+since `FB_Translucent` ignores alpha. That is the right one for it -- an
+additive surface's level was never about alpha either -- and the branch already
+existed for the translucent-without-alpha fallback.
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes

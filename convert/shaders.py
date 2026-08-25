@@ -404,8 +404,27 @@ def mesh_is_effect(pkg, index, mesh_ref, cache=None):
 # BLEND_Translucent maps to FB_AlphaBlend, which is exact -- but only where the
 # texture has an alpha channel to blend on. build_material falls back to
 # FB_Translucent where it does not; see there.
+#
+# BLEND_Additive maps to FB_Translucent rather than to the FB_Brighten its name
+# promises, and this is the one entry that is a judgement rather than a
+# translation. FB_Brighten is SRCALPHA/ONE: `dst + src`, a true add. UE3 means a
+# true add too -- but it accumulates in a float buffer and tonemaps, so two
+# overlapping light cones compress toward white. UE2 adds into eight bits and
+# clips at the first crossing, so the same two cones are simply white, and a
+# third adds nothing at all. Reported on WAR-PowerSurge, whose cones are drawn
+# two-sided and so stack against themselves before any other cone is involved.
+#
+# FB_Translucent is ONE/INVSRCCOLOR: `src + dst * (1 - src)`, the screen
+# operator. It is the LDR blend with the same shape as add-then-tonemap --
+# monotonic, saturating, and *identical* to a true add for one layer over black,
+# which is what an effect over an unlit background is. Where it differs is
+# exactly where the artefact was: 0.35 over 0.35 gives 0.58 rather than 0.70,
+# and a third layer 0.73 rather than a clamped 1.0. Black stays transparent
+# under both, an additive black adding nothing and a brightness-keyed black
+# being clear, so nothing about what is drawn changes -- only how the layers
+# meet. 495 materials across the map set are additive.
 FRAME_BUFFER_BLENDING = {
-    "BLEND_Additive": "FB_Brighten",
+    "BLEND_Additive": "FB_Translucent",
     "BLEND_Translucent": "FB_AlphaBlend",
     "BLEND_Modulate": "FB_Modulate",
 }
@@ -607,7 +626,9 @@ def build_material(material_set, texture_set, pkg, index, ref,
     # and which one depends on the blend. FB_AlphaBlend and FB_Brighten are
     # both driven by source alpha, so it goes in the ColorModifier's alpha;
     # FB_Translucent is ONE/INVSRCCOLOR and ignores alpha entirely, so there
-    # the level *is* the brightness and it scales the colour instead.
+    # the level *is* the brightness and it scales the colour instead. Additive
+    # surfaces take the second path now that they blend as FB_Translucent, which
+    # is the right one for them: their level was never about alpha either.
     alpha = 255
     if scale < 1.0:
         if framebuffer in ("FB_AlphaBlend", "FB_Brighten"):
