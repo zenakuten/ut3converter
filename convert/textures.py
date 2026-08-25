@@ -512,8 +512,40 @@ class TextureSet:
             if not bad:
                 spread = self._measure_spread(owner, export)
                 bad = spread is None or spread <= 1.0
+            if not bad:
+                bad = self._flat_bright_channel(owner, export)
             self._bake_cache[key] = bad
         return self._bake_cache[key]
+
+    @classmethod
+    def _flat_bright_channel(cls, owner, export):
+        """Is one channel pinned high across the whole texture?
+
+        Then it is packed data, not light. `T_LT_Floors_SM_Walkpipe01_F` is the
+        case reported on WAR-PowerSurge: red averages 72, green 1.8 and blue is
+        *255 at every pixel*. A channel that never varies carries no image, and
+        added over a surface it is a flat wash of that colour -- the cables, the
+        pipes and the whole power node came out violet.
+
+        `_measure_spread` cannot see it: it averages the three channels together,
+        so variation in red hides a constant blue. And `_is_normal_map` does not
+        either, this being nothing like a tangent-space normal (green is 1.8,
+        not 128).
+
+        A channel pinned at *zero* is left alone deliberately -- that is an
+        ordinary coloured glow, a red lamp being (200, 10, 10), and it adds
+        nothing where it is dark. Only a bright constant does damage. A texture
+        flat in every channel is already refused by the spread test above.
+        """
+        channels = cls._decode_smallest(owner, export)
+        if channels is None:
+            return False
+        for channel in channels:
+            if not channel:
+                continue
+            if max(channel) - min(channel) <= 8 and min(channel) >= 192:
+                return True
+        return False
 
     def _is_normal_map(self, owner, export):
         """Does this texture read as a tangent-space normal map?

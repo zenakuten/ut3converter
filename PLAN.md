@@ -2066,6 +2066,61 @@ Measured on the exported files:
 
 Sparse bright letters, not a white slab.
 
+**Phase 24 -- two things WAR-PowerSurge showed that HeatRay could not.**
+Reported with a screenshot: the cables, pipes and the whole power node platform
+were violet, and every light cone was a solid white triangle.
+
+*The violet.* `M_LT_Floors_SM_Walkpipe01` glows `T_LT_Floors_SM_Walkpipe01_F` --
+red averaging 72, green 1.8, and blue **255 at every pixel**. It is a packed
+channel mask, not art, and Phase 21 made glows *additive*, so a channel pinned
+high became a flat blue wash over everything wearing it.
+
+Nothing already in `_unusable_glow` could see it. `_measure_spread` averages the
+three channels together, so variation in red hides a constant blue -- it
+measured 41.7, well clear of the featureless threshold. `_is_normal_map` says no
+too, this being nothing like a tangent-space normal with green at 1.8 rather
+than 128. And the name scores 0: `_f` is in no table.
+
+`_flat_bright_channel` measures the thing directly: a channel whose whole range
+is 8 or less and whose floor is 192 or more carries no image, and added over a
+surface it is a wash of that colour. A channel pinned at *zero* is deliberately
+left alone -- that is an ordinary coloured glow, a red lamp being (200, 10, 10),
+and it adds nothing where it is dark; a texture flat in *every* channel is
+already refused by the spread test. Over the map set it costs **61 glow rows**,
+59 of them this texture and 2 an ice diffuse on WAR-Avalanche's pillars.
+
+*The white cones.* `M_LT_Light_SM_Lightcone01` multiplies by a `LightColor`
+vector parameter whose **DefaultValue is (0.1, 0.1, 0.05)**, and PowerSurge
+places the bare Material -- no instance anywhere. `diffuse_tint` only walked the
+instance chain, so it found nothing and the cones drew at full white on an
+additive blend. HeatRay hid this completely: every cone there is an instance
+that states a colour, which is what Phase 20 read.
+
+A parameter's own default is a value. `_parameter_default` reads it, under the
+same two conditions the instance walk applies -- the parameter must be named
+like a tint and must be one `reachable_parameters` says the graph actually
+reads. PowerSurge's 80 cones come out at (89, 89, 63): a third brightness, warm,
+which is what UT3 draws. **79 rows across 45 maps** gain a tint this way and
+**none change**, the fallback firing only where the walk came up empty.
+
+*And a cost the fallback introduced.* Reading defaults turned up materials
+stating tints nobody can see: PowerSurge's organic supports default to
+(239,240,241), a 6% dim with no hue, and that put a ColorModifier on **642
+actors**. A ColorModifier costs a texture stage and stages run out -- "No stages
+left for constant color modifier" is a real failure path
+(D3D9MaterialState.cpp:1751), which is why exact white was already refused. Near
+white is refused now for that reason alone: under 8% off white and under 8 apart
+is not a tint. The cave rock's (215,202,187) is kept.
+
+Rebuilt, the whole map moves by two things and nothing else:
+
+    336 Skins(0) removed   the purple pipe and cable Shaders
+    114 Skins(0) added     cave rock chunks gaining their warm tint
+
+and `T_LT_Floors_SM_Walkpipe01_F` is no longer exported at all, nothing
+referencing it. The 80 cones keep their Skins and their FinalBlend now wraps a
+ColorModifier at (89,89,63).
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes

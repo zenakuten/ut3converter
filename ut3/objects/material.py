@@ -1214,6 +1214,17 @@ def diffuse_tint(pkg, index, ref):
             break
         pkg_at, ref_at, depth = owner_at, parent, depth - 1
 
+    if best is None:
+        # Nothing in the instance chain overrides it -- which does not mean the
+        # parameter has no value. A VectorParameter carries its own
+        # DefaultValue, and a *bare Material* placed with no instance at all
+        # gets exactly that. WAR-PowerSurge's 80 light cones are the case: they
+        # use `M_LT_Light_SM_Lightcone01` directly, whose LightColor defaults to
+        # (0.1, 0.1, 0.05), and drawn at 1.0 on an additive blend they came out
+        # as solid white triangles. HeatRay's cones hid it, every one of them
+        # being an instance that states a colour.
+        best = _parameter_default(owner, index, base, live)
+
     if best is None or any(v > 1.0 for v in best):
         return None
     # A two-tone material has both of its colours baked into the texture
@@ -1269,6 +1280,30 @@ def diffuse_scale(pkg, index, ref):
         if level is None or not 0.0 < level < 1.0:
             return None
         return level
+    return None
+
+
+def _parameter_default(pkg, index, material, live):
+    """The DefaultValue of the material's own tint parameter, or None.
+
+    Only a parameter that is both named like a tint and one the graph actually
+    reads -- the same two conditions the instance walk applies, for the same
+    reasons.
+    """
+    for i, export in enumerate(pkg.exports):
+        if export.outer != material.index:
+            continue
+        if pkg.class_name_of(export) != "MaterialExpressionVectorParameter":
+            continue
+        props, start, _end = read_object_properties(pkg, export)
+        if start is None:
+            continue
+        name = str(props.get("ParameterName", ""))
+        if name not in live or name.lower().replace(" ", "") not in _DIFFUSE_TINTS:
+            continue
+        value = props.get("DefaultValue")
+        if isinstance(value, Struct) and value.value is not None:
+            return tuple(float(v) for v in value.value[:3])
     return None
 
 

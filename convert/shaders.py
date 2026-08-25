@@ -621,7 +621,14 @@ def build_material(material_set, texture_set, pkg, index, ref,
     # and still cost a texture stage at render time -- and stages run out,
     # "No stages left for constant color modifier" being a real failure path
     # (D3D9MaterialState.cpp:1751).
-    if colour == (255, 255, 255) and alpha == 255:
+    #
+    # *Near* white is refused for the second of those reasons alone. A material
+    # may state a tint that does nothing anybody can see: WAR-PowerSurge's
+    # organic supports default their DiffuseColor to (239,240,241), a 6% dim
+    # with no hue in it, and reading parameter defaults put a ColorModifier on
+    # 642 actors for it. Under 8% off white and under 8 apart is not a tint.
+    if alpha == 255 and colour is not None \
+            and min(colour) >= 235 and max(colour) - min(colour) <= 8:
         colour = None
     if colour is not None or alpha != 255:
         # ColorModifier multiplies the material under it by a constant, colour

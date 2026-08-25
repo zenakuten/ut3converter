@@ -867,6 +867,39 @@ def main(path):
     check("and it clamps rather than wrapping",
           max(dxt.decode_dxt5_channel(blown, 4, 4, 1)), 255)
 
+    print("a parameter's own default is a value")
+    # A VectorParameter carries a DefaultValue, and a bare Material placed with
+    # no instance gets exactly that. diffuse_tint only walked the instance
+    # chain, so WAR-PowerSurge's 80 light cones -- which use
+    # M_LT_Light_SM_Lightcone01 directly rather than one of its instances --
+    # drew at full white on an additive blend and came out as solid triangles.
+    # HeatRay hid it: every cone here is an instance that states a colour.
+    check("a bare material takes its parameter's default",
+          tint("M_LT_Light_SM_Lightcone01"), (89, 89, 63))
+    check("and an instance still wins over it",
+          tint("M_LT_Light_SM_Lightcone01_colorG"), (89, 89, 99))
+
+    print("a channel pinned high is data, not light")
+    # T_LT_Floors_SM_Walkpipe01_F: red 74..131, green 0..68, blue 255 at every
+    # pixel. Added over a surface that is a flat blue wash, and it turned
+    # WAR-PowerSurge's cables, pipes and power node violet.
+    pinned = p.find("T_LT_Floors_SM_Walkpipe01_F")
+    check_that("a pinned channel is refused as a glow",
+               pinned and TextureSet._flat_bright_channel(p, pinned[0]))
+    check_that("and _unusable_glow says so",
+               pinned and TextureSet("X")._unusable_glow(p, pinned[0]))
+    # _measure_spread cannot see it -- it averages the channels, so variation in
+    # red hides a constant blue -- and it is nothing like a normal map either.
+    check_that("the spread test alone would have passed it",
+               pinned and TextureSet._measure_spread(p, pinned[0]) > 1.0,
+               "%.1f" % TextureSet._measure_spread(p, pinned[0]) if pinned else "?")
+    check_that("and it is not a normal map",
+               pinned and not TextureSet("X")._is_normal_map(p, pinned[0]))
+    # A channel pinned at *zero* is an ordinary coloured glow and is left alone.
+    glowing = p.find("T_HU_Deco_SM_CitySign01b_E")
+    check_that("a real emissive is still usable",
+               glowing and not TextureSet("X")._unusable_glow(p, glowing[0]))
+
     print("generated UE2 materials (Phase 14)")
     from convert.shaders import FRAME_BUFFER_BLENDING
     from ut2.materials import MaterialSet
