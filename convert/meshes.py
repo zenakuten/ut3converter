@@ -60,6 +60,7 @@ class MeshStats:
         self.skipped_hidden = 0
         self.uv_channels = {}       # mesh -> the UV set its material asks for
         self.skinned = 0            # actors given a generated UE2 material
+        self.culled = 0             # actors carrying UT3's own draw distance
 
     def __str__(self):
         out = ("%d static meshes (%d triangles), %d actors placing %d triangles"
@@ -88,6 +89,8 @@ class MeshStats:
         if self.non_colliding or self.non_blocking:
             out += "; %d walk-through, %d non-blocking (as UT3 has them)" % (
                 self.non_colliding, self.non_blocking)
+        if self.culled:
+            out += "; %d drawing only within UT3's own cull distance" % self.culled
         if self.skipped_unreadable:
             out += "; %d meshes unreadable" % self.skipped_unreadable
         if self.uv_channels:
@@ -195,6 +198,44 @@ def _collision_off(props, comp):
     if props.get("bCollideActors") is False:
         return True
     return comp is not None and comp.get("CollideActors") is False
+
+
+def _cull_distance(props, comp):
+    """How far UT3 draws this actor, or None for "always".
+
+    UE3 states it on the component as `CachedCullDistance` -- the value the cook
+    settled on -- with `CullDistance` as the authored one behind it. UT3 sets it
+    on almost everything: 3,974 of WAR-PowerSurge's 4,106 mesh components, and
+    86,020 across the map set. UE2 has the same idea on the actor, `CullDistance`
+    (Engine/Actor.uc:133, "0 == no distance cull").
+
+    The two engines measure it from different places, and the difference is in
+    our favour. `CheckCullDistance` compares against `BoxDistanceSqr`
+    (UnRenderVisibility.cpp:23, :46) -- the distance to the nearest point of the
+    actor's bounding box -- where UE3 measures to the bounds centre. Box
+    distance is never the larger of the two, so a number carried across culls no
+    earlier here than it did in UT3, which is the safe direction for a big mesh
+    with a distant origin.
+
+    UE2 also scales the test by `CullDistanceFOVBias`, `tan(FOV/2)`
+    (UnRenderVisibility.cpp:1526). That is exactly 1.0 at UT2004's default FOV of
+    90, so the numbers mean what they say; a player on a wider FOV culls sooner
+    and one zoomed in culls later, which is the behaviour UT2004's own maps get.
+    """
+    for source in (comp, props):
+        if source is None:
+            continue
+        for key in ("CachedCullDistance", "CullDistance"):
+            value = source.get(key)
+            if value is None:
+                continue
+            try:
+                distance = float(value)
+            except (TypeError, ValueError):
+                continue
+            if distance > 0.0:
+                return distance
+    return None
 
 
 def _material_overrides(pkg, comp):
@@ -428,6 +469,10 @@ def convert_actors(pkg, index, mesh_set, texture_set=None, scale=1.0, stats=None
             properties.append(("DrawScale", "%f" % draw_scale))
         if placed_scale3d != (1.0, 1.0, 1.0):
             properties.append(("DrawScale3D", vec(placed_scale3d)))
+        cull = _cull_distance(props, comp)
+        if cull is not None:
+            properties.append(("CullDistance", "%f" % (cull * scale)))
+            stats.culled += 1
         pre_pivot = props.get("PrePivot")
         if pre_pivot is not None and pre_pivot.value and any(pre_pivot.value):
             properties.append(("PrePivot", vec([c * scale for c in pre_pivot.value])))

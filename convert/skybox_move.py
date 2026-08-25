@@ -108,6 +108,13 @@ def move_to_skybox(actors, map_center, sky_center, scale, name_prefix="Sky_"):
                 properties.append((key, vec(new_location)))
             elif key == "DrawScale":
                 properties.append((key, "%f" % (float(value) * scale)))
+            elif key == "CullDistance":
+                # Dropped, not rescaled. UT3's draw distance was measured from
+                # the play area to where the mesh stood in the level; the copy
+                # in the sky room is seen from the skybox camera instead, and
+                # any number carried over would hide it outright. Backdrop
+                # geometry is always drawn.
+                continue
             else:
                 properties.append((key, value))
         if not any(k == "DrawScale" for k, _v in properties):

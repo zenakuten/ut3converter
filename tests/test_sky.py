@@ -46,6 +46,31 @@ def main():
     check_that("UT3's dome is recognised", looks_like_sky("S_UN_Sky_SM_Dome01"))
     check_that("ordinary meshes are not", not looks_like_sky("S_LT_Floor_SM_Panel"))
 
+    print("what the sky room does not inherit")
+    # A backdrop copy is seen from the skybox camera, not from where the mesh
+    # stood in the level, so UT3's draw distance means nothing there -- carried
+    # over it would hide the geometry outright. Everything else survives the
+    # move, DrawScale being rescaled with the position.
+    from convert.skybox_move import move_to_skybox
+    from ut2.t3d import Actor
+
+    moved = move_to_skybox(
+        [Actor("StaticMeshActor", "M", [
+            ("StaticMesh", "StaticMesh'P.S_Dome'"),
+            ("Location", "(X=100.000000,Y=0.000000,Z=0.000000)"),
+            ("DrawScale", "2.000000"),
+            ("CullDistance", "14000.000000"),
+        ])],
+        map_center=(0.0, 0.0, 0.0), sky_center=(0.0, 0.0, 100000.0), scale=0.25)
+    keys = [k for k, _v in moved[0].properties]
+    check_that("a backdrop copy drops its cull distance", "CullDistance" not in keys,
+               str(keys))
+    check("and keeps its mesh", dict(moved[0].properties)["StaticMesh"],
+          "StaticMesh'P.S_Dome'")
+    check("with DrawScale rescaled by the move",
+          dict(moved[0].properties)["DrawScale"], "0.500000")
+    check_that("and is marked unlit", dict(moved[0].properties).get("bUnlit") == "True")
+
     print("inline fit keeps UT3's authored size")
     # The dome is UT3's, not a shrink-wrap of the level: a sky scaled to just
     # clear the geometry sits far too close to read as a horizon.

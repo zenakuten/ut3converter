@@ -2164,6 +2164,52 @@ since `FB_Translucent` ignores alpha. That is the right one for it -- an
 additive surface's level was never about alpha either -- and the branch already
 existed for the translucent-without-alpha fallback.
 
+**Phase 26 -- UT3's own draw distance, which was being thrown away.** Noticed
+while answering whether UT3 meshes carry LODs. They do not: instrumenting
+`_read_lods` to record the `lod_count` it reads shows **1** for every one of the
+2,068 static meshes in all 114 UT3 `Environments` packages, and the same for
+WAR-PowerSurge's 214, DM-HeatRay's 205, Gears' 852 and TOXIKK's. UE2 has no
+static-mesh LOD chain either -- `UnStaticMesh.h` is 594 lines with `UStaticMesh`
+at :417 and not one mention of LOD, the only Engine header that has any being
+`UnSkeletalMesh.h`. So there is no LOD question to answer on either side.
+
+What UT3 uses instead is per-component distance culling, and it uses it on
+nearly everything: `CachedCullDistance` is set on **3,974 of WAR-PowerSurge's
+4,106** mesh components and on **86,020 across 67 of the 157 maps**. UE2 has the
+same property on the actor -- `CullDistance` (Engine/Actor.uc:133, "0 == no
+distance cull") -- and the converter was dropping all of it, so every piece of
+decoration drew from anywhere in the map.
+
+*The two engines measure it from different places, and the difference is in our
+favour.* `CheckCullDistance` compares the square of the distance against
+`BoxDistanceSqr` (UnRenderVisibility.cpp:23, :46), the distance to the nearest
+point of the actor's *bounding box*, where UE3 measures to the bounds centre.
+Box distance is never the larger of the two, so a number carried across culls no
+earlier here than it did in UT3 -- which is what makes it safe on a big mesh
+with a distant origin, the failure this looked most likely to have. UE2 also
+scales the test by `CullDistanceFOVBias`, `tan(FOV/2)` (:1526), which is exactly
+1.0 at UT2004's default FOV of 90; a wider FOV culls sooner and a zoomed-in one
+later, as it does for UT2004's own maps.
+
+*Two things deliberately left out.* Movers keep drawing -- `convert_movers` is a
+separate path and was not touched, a lift that vanishes being far worse than one
+drawn too far. And `move_to_skybox` **drops** the property rather than rescaling
+it: a backdrop copy is seen from the skybox camera, not from where the mesh
+stood in the level, so any number carried over would hide it outright. Verified
+on DM-HeatRay: 72 sky actors, none of them culled, against 2,343 in the level.
+
+Culling is a render-visibility test only -- the calls are all in
+UnRenderVisibility.cpp, UnRender.cpp and UnShadowProjector.cpp -- so collision
+is unaffected and a culled prop is still solid.
+
+    ONS-PowerSurge   4057 mesh actors, 3968 culled (98%)  min 10000  median 14000
+    DM-HeatRay       2405 mesh actors, 2343 culled (97%)  min  2000  median  4500
+    DM-Deck          4742 mesh actors, 6 in the source; the map does not use it
+
+The shortest distances are on the right things: HeatRay's 2,000 is a door light
+and its 2,500 a fern. The 90 maps with none are the AFF and TOXIKK sets, whose
+authors did not use the feature.
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes

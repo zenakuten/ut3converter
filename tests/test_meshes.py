@@ -153,6 +153,28 @@ def main(path):
                               skip_effects=False)
     check("effect actors skipped when no material can be built", len(allm) - len(kept), 26)
     check_that("--keep-effect-meshes converts them", len(allm) > len(kept))
+    print("UT3's own draw distance")
+    # UE3 states it on the component as CachedCullDistance and sets it on almost
+    # everything -- 3,974 of WAR-PowerSurge's 4,106 mesh components, 86,020
+    # across the map set -- and UE2 has the same property on the actor. Dropping
+    # it meant every piece of decoration drew from anywhere in the map.
+    from convert.meshes import _cull_distance
+
+    culled = [dict(a.properties)["CullDistance"] for a in kept
+              if any(k == "CullDistance" for k, _v in a.properties)]
+    check_that("most actors carry one", len(culled) > len(kept) // 2,
+               "%d of %d" % (len(culled), len(kept)))
+    check_that("and every one is positive",
+               all(float(v) > 0.0 for v in culled))
+    # The component's value wins over the actor's, and a zero or missing one
+    # means "always draw" rather than "never".
+    check("a component that states one is read",
+          _cull_distance({}, {"CachedCullDistance": 14000.0}), 14000.0)
+    check("the authored value stands in where the cooked one is absent",
+          _cull_distance({}, {"CullDistance": 9000.0}), 9000.0)
+    check("zero means always, not never", _cull_distance({}, {"CachedCullDistance": 0.0}), None)
+    check("and so does nothing at all", _cull_distance({}, {}), None)
+
     rich = TextureSet("M")
     drawn, drawn_stats = convert_actors(p, index, MeshSet("M"), rich, skip_effects=True)
     check_that("with materials on they are drawn instead of skipped",
