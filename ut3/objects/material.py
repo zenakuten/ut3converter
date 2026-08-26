@@ -235,7 +235,8 @@ def live_branch(pkg, index, export, props, params):
     return "A" if on else "B"
 
 
-def _collect(pkg, index, export, depth, seen, found, params=None, follow=None):
+def _collect(pkg, index, export, depth, seen, found, params=None, follow=None,
+             lightmass=False):
     """Every texture sample reachable from `export`, in graph order.
 
     Reachable means through the branches this material actually compiles: see
@@ -262,13 +263,20 @@ def _collect(pkg, index, export, depth, seen, found, params=None, follow=None):
     cls = pkg.class_name_of(export)
     if cls == "MaterialExpressionStaticSwitchParameter":
         keys = (live_branch(pkg, index, export, props, params),)
-    elif cls == "MaterialExpressionLightmassReplace":
+    elif cls == "MaterialExpressionLightmassReplace" and lightmass:
         # Two inputs, and only one of them is ever rendered: `Realtime` is what
         # the game draws, `Lightmass` what the lightmap baker sees instead.
-        # Neither is in FOLLOW_INPUTS, so the walk used to stop dead here --
-        # BL-Dekk's `SF_M_Light_Mat` hangs its whole EmissiveColor off one, and
-        # the light fixtures came out with no glow at all. TOXIKK's holo ads do
-        # the same.
+        # Neither is in FOLLOW_INPUTS, so the walk stops dead here -- BL-Dekk's
+        # `SF_M_Light_Mat` hangs its whole EmissiveColor off one, and the light
+        # fixtures came out with no glow at all. TOXIKK's holo ads do the same.
+        #
+        # Followed only when hunting the *emissive*. Opening it on the diffuse
+        # walk as well reaches past the node into layers that are not the
+        # surface: TOXIKK's liquid pipe stopped drawing its bubble mask and
+        # picked up `T_HighTechFloors_Varity`, a floor texture, and CTF-Shaft's
+        # river its own MacroNormal. What a glow is made of and what a surface
+        # is painted with are different questions, and this one only had to be
+        # answered for the first.
         keys = ("Realtime",)
     for key in keys:
         for value in props.get_all(key):
@@ -281,7 +289,7 @@ def _collect(pkg, index, export, depth, seen, found, params=None, follow=None):
             if sub_export is None:
                 continue
             _collect(sub_owner, index, sub_export, depth - 1, seen, found,
-                     params, follow)
+                     params, follow, lightmass)
 
 
 # What the texture an *effect* is drawn with is called, where it differs from
@@ -498,25 +506,7 @@ def reachable_parameters(pkg, index, material_export, params=None):
     return _reachable(pkg, index, material_export, params)[1]
 
 
-def colour_input_has_texture(pkg, index, material_export, params=None):
-    """Does this material's DiffuseColor input sample any texture at all?
-
-    Asked before the last-resort scan, and it is the difference between "we
-    could not follow this graph" and "there is nothing there to follow". The
-    scan takes every texture the material owns whatever input it hangs off, so
-    on a material whose colour is computed rather than sampled it reaches
-    across to a specular or parallax map and paints the surface with it --
-    TOXIKK's liquid pipe came out wearing `T_HighTechFloors_Varity`, a floor.
-
-    `_reachable` is the right tool because it follows every property that
-    resolves to an expression rather than a chosen list, so a negative answer
-    means the colour path really is textureless.
-    """
-    return bool(_reachable(pkg, index, material_export, params,
-                           inputs=("DiffuseColor",))[0])
-
-
-def _reachable(pkg, index, material_export, params=None, inputs=None):
+def _reachable(pkg, index, material_export, params=None):
     """(texture keys, vector parameter names) reachable through live branches.
 
     Its own traversal rather than `_collect`'s. That one follows a fixed list of
@@ -565,7 +555,7 @@ def _reachable(pkg, index, material_export, params=None, inputs=None):
                 continue
             visit(sub_owner, sub, depth - 1)
 
-    for key in (inputs or _MATERIAL_INPUTS):
+    for key in _MATERIAL_INPUTS:
         ref = _expression_ref(props.get(key))
         if ref is None or ref.is_null:
             continue
@@ -878,18 +868,7 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None, params=None):
     # DM-Dekk's black water with red-fringed bubbles. Left alone, the body falls
     # through to its own colour and `resolve_emissive` puts the bubbles in the
     # glow, where the black contributes nothing. 21 materials across the map set.
-    # Only a colour input that provably samples nothing counts: see
-    # colour_input_has_texture. A DiffuseColor the walk merely could not follow
-    # is a different thing, and there the emissive remains the better guess --
-    # narrowing this from "has a DiffuseColor input" to "has one with no texture
-    # in it" is what keeps CTF-LostCause's river off its own MacroNormal and
-    # leaves 40-odd surfaces their texture.
-    textureless_colour = (
-        _expression_ref(props.get("DiffuseColor")) is not None
-        and not colour_input_has_texture(owner, index, export, params))
     for key in DIFFUSE_INPUTS:
-        if key == "EmissiveColor" and textureless_colour:
-            continue
         value = props.get(key)
         ref_expr = _expression_ref(value)
         if ref_expr is None or ref_expr.is_null:
@@ -938,12 +917,6 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None, params=None):
             if sample is not None:
                 _LAST_SAMPLE[0] = sample
             return found_owner, found
-
-    # A colour input that samples nothing is an answer, not a failure: the
-    # material computes its colour, and the scan below would reach across to
-    # some other input and paint the surface with a specular or parallax map.
-    if textureless_colour:
-        return None, None
 
     # Fall back to whichever of the material's own textures looks most diffuse.
     candidates = _subobject_textures(owner, index, export, params)
@@ -1190,7 +1163,8 @@ def resolve_emissive(pkg, index, ref, reject=None):
     # `..._EPan`, and rejecting the winner returned nothing at all rather than
     # falling through to the one behind it.
     candidates = []
-    _collect(expr_owner, index, expr_export, 12, set(), candidates, params)
+    _collect(expr_owner, index, expr_export, 12, set(), candidates, params,
+             lightmass=True)
     usable = [entry for entry in candidates
               if reject is None or not reject(entry[0], entry[1])]
     if not usable:

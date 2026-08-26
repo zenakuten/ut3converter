@@ -2245,28 +2245,26 @@ holograms (57) and ad screens (40) and AFF's console screens (54) *gain* the
 scroll they always had, while terrain rock, mud and snow (20) lose one they
 never should have had.
 
-*The pipe was painted with its own bubbles.* `M_LiquidEdenGlass_Base` reaches no
-texture at all through `DiffuseColor` -- water colour, cubemap and fresnel, all
-arithmetic -- and reaches `SF_T_TilingBubbles_M` through `EmissiveColor`.
-EmissiveColor is in `DIFFUSE_INPUTS` because an *unlit* material has no diffuse
-and its emissive is the whole of it, but a lit surface that states a colour input
-and computes it is a different thing, and what hangs off its emissive is a glow.
-The bubble mask is black but for sparse specks in red and blue, which is exactly
-what the pipe looked like.
+*The pipe was not a bug, and the fix for it was reverted.* `M_LiquidEdenGlass_Base`
+reaches no texture through `DiffuseColor` -- water colour, cubemap and fresnel,
+all arithmetic -- and reaches `SF_T_TilingBubbles_M` through `EmissiveColor`, a
+mask that is black but for sparse specks in red and blue. That looked like the
+obvious cause of "black water with red-fringed bubbles", and it was made to fall
+through to its own colour instead, with the bubbles moved to the glow.
 
-The condition had to be narrowed once. "Has a DiffuseColor input" was too broad
-and cost 40-odd surfaces their texture; "has one that provably samples nothing"
-is the right test, and `colour_input_has_texture` answers it with `_reachable`,
-which follows every property that resolves to an expression rather than a chosen
-list. The same test then refuses the last-resort scan, which would otherwise
-reach across to a specular or parallax map -- it had the pipe wearing a floor.
+Judged in the game, the original was better: a dark tinted mask with scrolling
+bright specks reads as liquid in a glass pipe, and the alternative did not. So
+the change is out. What stays is the narrower lesson it taught --
+`LightmassReplace` is followed **only** when hunting the emissive. Opening it on
+the diffuse walk as well is what had pushed the pipe onto
+`T_HighTechFloors_Varity`, a floor texture, and CTF-Shaft's river onto its own
+MacroNormal: reaching past that node finds layers that are not the surface. What
+a glow is made of and what a surface is painted with are different questions, and
+only the first one needed answering.
 
-Fifteen materials across the map set stop being painted with something that was
-never colour, and every one is water or ice: `M_Ocean_Water_Pool` off
-`T_WaterFroth_01_D`, `M_UN_Liquid_SM_ChasmBlueOcean_01` off a wave-ripple normal,
-`M_UN_Liquid_BSP_SoftRiver_01` off its own normal, `MrFreeze` off `N_ice`.
-Because `water_substitute` only fires where a material resolves to no colour,
-this *unblocks* it: CTF-Reflection goes from none to six stock water surfaces.
+Measured after the revert, diffuse resolution across all 157 maps is **unchanged
+from before this phase** -- every surface keeps the texture it had -- and the
+206 panner corrections, the lamp's glow and the pool's material stand.
 
 *The pool was a placeholder: a mover, and a name up the chain.* Two gaps.
 `water_substitute` was only ever called from `convert_actors`, so movers never
@@ -2282,7 +2280,7 @@ applies the skin.
 
 Rebuilt, the four actors read:
 
-    StaticMeshActor_230   Shader: tinted diffuse + additive bubble glow
+    StaticMeshActor_230   ColorModifier over a TexPanner, (61,80,100) -- as it was
     StaticMeshActor_2993  Skins(0) ColorModifier, no TexPanner (the housing)
                           Skins(1) Shader: (209,228,255) diffuse, (63,160,255) glow
     InterpActor_6         FinalBlend'UCGeneric.Glass.glass06_finalblend'

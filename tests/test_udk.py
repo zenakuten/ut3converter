@@ -232,19 +232,16 @@ def main(content):
             check("an overridden texture does not inherit a stray Panner",
                   material_panner(dekk, index, rails), None)
 
-        # A colour input that samples nothing is an answer: M_LiquidEdenGlass
-        # computes its water colour and hangs its bubbles off EmissiveColor, and
-        # painting the pipe with the bubble overlay is DM-Dekk's black water.
+        # LightmassReplace is followed when hunting the emissive and *not* when
+        # hunting the diffuse. Opening it on both reaches past the node into
+        # layers that are not the surface: the liquid pipe stopped drawing its
+        # bubble mask and picked up `T_HighTechFloors_Varity`, a floor texture.
+        # Judged in the game, the mask is the better of the two.
         pipe = by_name.get("M_LiquidEdenGlass_SphereCorrected_INST")
         if pipe is not None:
             _o, tex = resolve_diffuse(dekk, index, pipe)
-            check_that("a liquid is not painted with its bubble overlay",
-                       tex is None or tex.name != "SF_T_TilingBubbles_M",
-                       tex.name if tex else "no texture")
-            _go, bubbles = resolve_emissive(dekk, index, pipe,
-                                            reject=ts._unusable_glow)
-            check("the bubbles become its glow instead",
-                  bubbles.name if bubbles else None, "SF_T_TilingBubbles_M")
+            check("a liquid keeps the texture its colour path resolves",
+                  tex.name if tex else None, "SF_T_TilingBubbles_M")
 
         # Matinee names an instance per animated parameter, so the leaf says
         # nothing; the identity is up the chain.
