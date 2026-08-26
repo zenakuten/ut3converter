@@ -259,8 +259,17 @@ def _collect(pkg, index, export, depth, seen, found, params=None, follow=None):
     if start is None:
         return
     keys = follow or FOLLOW_INPUTS
-    if pkg.class_name_of(export) == "MaterialExpressionStaticSwitchParameter":
+    cls = pkg.class_name_of(export)
+    if cls == "MaterialExpressionStaticSwitchParameter":
         keys = (live_branch(pkg, index, export, props, params),)
+    elif cls == "MaterialExpressionLightmassReplace":
+        # Two inputs, and only one of them is ever rendered: `Realtime` is what
+        # the game draws, `Lightmass` what the lightmap baker sees instead.
+        # Neither is in FOLLOW_INPUTS, so the walk used to stop dead here --
+        # BL-Dekk's `SF_M_Light_Mat` hangs its whole EmissiveColor off one, and
+        # the light fixtures came out with no glow at all. TOXIKK's holo ads do
+        # the same.
+        keys = ("Realtime",)
     for key in keys:
         for value in props.get_all(key):
             ref = _expression_ref(value)
@@ -489,7 +498,25 @@ def reachable_parameters(pkg, index, material_export, params=None):
     return _reachable(pkg, index, material_export, params)[1]
 
 
-def _reachable(pkg, index, material_export, params=None):
+def colour_input_has_texture(pkg, index, material_export, params=None):
+    """Does this material's DiffuseColor input sample any texture at all?
+
+    Asked before the last-resort scan, and it is the difference between "we
+    could not follow this graph" and "there is nothing there to follow". The
+    scan takes every texture the material owns whatever input it hangs off, so
+    on a material whose colour is computed rather than sampled it reaches
+    across to a specular or parallax map and paints the surface with it --
+    TOXIKK's liquid pipe came out wearing `T_HighTechFloors_Varity`, a floor.
+
+    `_reachable` is the right tool because it follows every property that
+    resolves to an expression rather than a chosen list, so a negative answer
+    means the colour path really is textureless.
+    """
+    return bool(_reachable(pkg, index, material_export, params,
+                           inputs=("DiffuseColor",))[0])
+
+
+def _reachable(pkg, index, material_export, params=None, inputs=None):
     """(texture keys, vector parameter names) reachable through live branches.
 
     Its own traversal rather than `_collect`'s. That one follows a fixed list of
@@ -538,7 +565,7 @@ def _reachable(pkg, index, material_export, params=None):
                 continue
             visit(sub_owner, sub, depth - 1)
 
-    for key in _MATERIAL_INPUTS:
+    for key in (inputs or _MATERIAL_INPUTS):
         ref = _expression_ref(props.get(key))
         if ref is None or ref.is_null:
             continue
@@ -687,6 +714,44 @@ def names_diffuse_slot(parameter):
     return any(token in low for token in DIFFUSE_SLOTS)
 
 
+def _parameter_sample(pkg, index, ref, name, depth=8):
+    """The sample a named texture parameter is read by: (package, export).
+
+    An instance's `TextureParameterValues` entry replaces the texture *inside*
+    an existing sample, so that sample -- and its Coordinates -- is what draws
+    it. Finding it is what keeps `material_panner` from falling back to the
+    material at large: BL-Dekk's `MF_M_Rails_INST` states channel 0 of
+    `MF_T_Trims_01_M`, and with no sample recorded the fallback found a Panner
+    on a scrolling layer that is never drawn and set the light fixtures'
+    housings sliding.
+    """
+    while depth > 0 and ref is not None and not ref.is_null:
+        owner, export = index.resolve(pkg, ref)
+        if export is None:
+            return None
+        props, start, _end = read_object_properties(owner, export)
+        if start is None:
+            return None
+        if owner.class_name_of(export) not in ("MaterialInstanceConstant",
+                                               "MaterialInstanceTimeVarying"):
+            for candidate in owner.exports:
+                if candidate.outer != export.index:
+                    continue
+                if "TextureSampleParameter" not in owner.class_name_of(candidate):
+                    continue
+                sample_props, sample_start, _e = read_object_properties(owner, candidate)
+                if sample_start is None:
+                    continue
+                if str(sample_props.get("ParameterName", "")) == name:
+                    return owner, candidate
+            return None
+        parent = props.get("Parent")
+        if parent is None or parent.is_null:
+            return None
+        pkg, ref, depth = owner, parent, depth - 1
+    return None
+
+
 def resolve_diffuse(pkg, index, ref, depth=12, reject=None, params=None):
     """Resolve a material reference to (Package, Texture2D export), or (None, None).
 
@@ -729,14 +794,15 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None, params=None):
                 name = str(entry.get("ParameterName", tex.name))
                 channel = declared_diffuse_channel(name)
                 if channel is not None and declared is None:
-                    declared = (tex_owner, tex, channel)
+                    declared = (tex_owner, tex, channel, name)
                 score = score_texture_name(name) + score_texture_name(tex.name)
                 if best is None or score < best[0]:
-                    best = (score, tex_owner, tex, names_diffuse_slot(name))
+                    best = (score, tex_owner, tex, names_diffuse_slot(name), name)
         # A declared channel settles it: the material has said outright where
         # its colour lives, so neither the scoring nor the parent gets a vote.
         if declared is not None:
             _LAST_ALBEDO[0] = declared[2]
+            _LAST_SAMPLE[0] = _parameter_sample(pkg, index, ref, declared[3])
             return declared[0], declared[1]
         # An instance that overrides only some parameters must not short-circuit
         # its parent. CTF-FacingWorlds' cliffs are the case: the instance
@@ -769,6 +835,7 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None, params=None):
             # a material's own statement painted 111 of BL-Dekk's meshes with
             # the mud texture its parent happened to carry.
             if best[3] and score_texture_name(best[2].name) < NOT_DIFFUSE:
+                _LAST_SAMPLE[0] = _parameter_sample(pkg, index, ref, best[4])
                 return best[1], best[2]
             if reject is not None:
                 if reject(best[1], best[2]) and not reject(*inherited):
@@ -784,6 +851,7 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None, params=None):
             if score_texture_name(inherited[1].name) < score_texture_name(best[2].name):
                 return inherited
         if best is not None:
+            _LAST_SAMPLE[0] = _parameter_sample(pkg, index, ref, best[4])
             return best[1], best[2]
         return inherited
 
@@ -798,7 +866,30 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None, params=None):
     # penalty and T_LT_Light_SM_LightCone_Dust02 -- flat, shapeless noise --
     # scores 0 and wins, so the cone rendered as a grey static panel.
     scorer = score_effect_name if is_effect_material(props) else None
+    # A material that has a DiffuseColor input does not take its surface texture
+    # off the emissive one. EmissiveColor is in DIFFUSE_INPUTS because an *unlit*
+    # material has no diffuse at all and its emissive is the whole of it -- but
+    # a lit surface that states a colour input and simply computes it rather
+    # than sampling a texture is a different thing, and what hangs off its
+    # emissive is a glow, not its skin. TOXIKK's `M_LiquidEdenGlass_Base` is the
+    # case: DiffuseColor reaches no texture (water colour, cubemap and fresnel),
+    # EmissiveColor reaches `SF_T_TilingBubbles_M`, and painting the pipe with
+    # the bubble overlay -- black but for sparse specks in red and blue -- is
+    # DM-Dekk's black water with red-fringed bubbles. Left alone, the body falls
+    # through to its own colour and `resolve_emissive` puts the bubbles in the
+    # glow, where the black contributes nothing. 21 materials across the map set.
+    # Only a colour input that provably samples nothing counts: see
+    # colour_input_has_texture. A DiffuseColor the walk merely could not follow
+    # is a different thing, and there the emissive remains the better guess --
+    # narrowing this from "has a DiffuseColor input" to "has one with no texture
+    # in it" is what keeps CTF-LostCause's river off its own MacroNormal and
+    # leaves 40-odd surfaces their texture.
+    textureless_colour = (
+        _expression_ref(props.get("DiffuseColor")) is not None
+        and not colour_input_has_texture(owner, index, export, params))
     for key in DIFFUSE_INPUTS:
+        if key == "EmissiveColor" and textureless_colour:
+            continue
         value = props.get(key)
         ref_expr = _expression_ref(value)
         if ref_expr is None or ref_expr.is_null:
@@ -847,6 +938,12 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None, params=None):
             if sample is not None:
                 _LAST_SAMPLE[0] = sample
             return found_owner, found
+
+    # A colour input that samples nothing is an answer, not a failure: the
+    # material computes its colour, and the scan below would reach across to
+    # some other input and paint the surface with a specular or parallax map.
+    if textureless_colour:
+        return None, None
 
     # Fall back to whichever of the material's own textures looks most diffuse.
     candidates = _subobject_textures(owner, index, export, params)
@@ -1304,6 +1401,46 @@ def _parameter_default(pkg, index, material, live):
         value = props.get("DefaultValue")
         if isinstance(value, Struct) and value.value is not None:
             return tuple(float(v) for v in value.value[:3])
+    return None
+
+
+# What a *glow's* colour is called. Deliberately not `_DIFFUSE_TINTS`, and
+# deliberately without "diffusecolor" in it: a material states the two
+# separately and they are not the same colour. BL-Dekk's `SF_M_Light_rail_INST`
+# sets DiffuseColor to (0.64, 0.78, 1.0), a pale blue for the lit housing, and
+# LightColor to (0.05, 0.35, 1.0), the strong blue the lamp glows -- and taking
+# the first left the light reading white.
+_EMISSIVE_TINTS = ("lightcolor", "emissivecolor", "glowcolor", "emissivetint")
+
+
+def emissive_tint(pkg, index, ref):
+    """The constant colour a material multiplies its *glow* by, or None.
+
+    Read the same way `diffuse_tint` reads its own: only a parameter the graph
+    actually reads, only from the instance chain, and white and values above one
+    are refused because a ColorModifier multiplies by a byte and can neither
+    boost nor usefully state one.
+    """
+    from . import graph as G
+
+    owner, base, props = base_material(pkg, index, ref)
+    if props is None:
+        return None
+    live = reachable_parameters(owner, index, base,
+                               G.collect_parameters(pkg, index, ref))
+    if not live:
+        return None
+    values = _live_vectors(pkg, index, ref, live)
+    for wanted in _EMISSIVE_TINTS:
+        for name, value in values.items():
+            if name.lower().replace(" ", "") != wanted:
+                continue
+            if any(v > 1.0 for v in value):
+                return None
+            colour = G.to_color(value)[:3]
+            if colour in ((255, 255, 255), (0, 0, 0)):
+                return None
+            return colour
     return None
 
 

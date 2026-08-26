@@ -2210,6 +2210,83 @@ The shortest distances are on the right things: HeatRay's 2,000 is a door light
 and its 2,500 a fern. The 90 maps with none are the AFF and TOXIKK sets, whose
 authors did not use the feature.
 
+**Phase 27 -- four DM-Dekk faults, and they were four different bugs.** Reported
+together: a liquid pipe drawn black with red-fringed bubbles, a light fixture
+whose lamp was white instead of glowing blue and whose housing scrolled, and a
+water plane that was the checkerboard placeholder.
+
+*The lamp had no glow: `MaterialExpressionLightmassReplace`.* Its two inputs are
+`Realtime`, what the game draws, and `Lightmass`, what the lightmap baker sees
+instead. Neither is in `FOLLOW_INPUTS`, so `_collect` stopped dead at the node
+and `resolve_emissive` returned nothing at all. `SF_M_Light_Mat` hangs its whole
+EmissiveColor off one; so do TOXIKK's holo ads, which is the same node that sent
+the hologram walk to the opacity input back in Phase 19. Following `Realtime`
+is all it took.
+
+*And the glow's colour is not the diffuse's.* `SF_M_Light_rail_INST` states
+`DiffuseColor` (0.64, 0.78, 1.0) for the housing it lights and `LightColor`
+(0.05, 0.35, 1.0) for what it emits, and `diffuse_tint` took the first of them
+for both. `emissive_tint` reads the second, and the ColorModifier it makes wraps
+the *glow texture* rather than the Shader, since Phase 22 established that a
+wrapper reaches the specular stage too. The lamp is (63,160,255) additive over a
+(209,228,255) housing now.
+
+*The housing scrolled: a sample that was never recorded.* An instance's
+`TextureParameterValues` entry replaces the texture *inside* an existing sample,
+so that sample's coordinates are what draws it -- but `resolve_diffuse` returned
+from its override branch without setting `_LAST_SAMPLE`, and `material_panner`
+fell back to the material at large and found a Panner on a layer that is never
+drawn. `_parameter_sample` walks to the base material and finds the
+`TextureSampleParameter*` the overridden name belongs to.
+
+That one is worth more than the fault that found it. Over the map set it moves
+**220 panners**, and the four largest groups are all corrections: TOXIKK's
+holograms (57) and ad screens (40) and AFF's console screens (54) *gain* the
+scroll they always had, while terrain rock, mud and snow (20) lose one they
+never should have had.
+
+*The pipe was painted with its own bubbles.* `M_LiquidEdenGlass_Base` reaches no
+texture at all through `DiffuseColor` -- water colour, cubemap and fresnel, all
+arithmetic -- and reaches `SF_T_TilingBubbles_M` through `EmissiveColor`.
+EmissiveColor is in `DIFFUSE_INPUTS` because an *unlit* material has no diffuse
+and its emissive is the whole of it, but a lit surface that states a colour input
+and computes it is a different thing, and what hangs off its emissive is a glow.
+The bubble mask is black but for sparse specks in red and blue, which is exactly
+what the pipe looked like.
+
+The condition had to be narrowed once. "Has a DiffuseColor input" was too broad
+and cost 40-odd surfaces their texture; "has one that provably samples nothing"
+is the right test, and `colour_input_has_texture` answers it with `_reachable`,
+which follows every property that resolves to an expression rather than a chosen
+list. The same test then refuses the last-resort scan, which would otherwise
+reach across to a specular or parallax map -- it had the pipe wearing a floor.
+
+Fifteen materials across the map set stop being painted with something that was
+never colour, and every one is water or ice: `M_Ocean_Water_Pool` off
+`T_WaterFroth_01_D`, `M_UN_Liquid_SM_ChasmBlueOcean_01` off a wave-ripple normal,
+`M_UN_Liquid_BSP_SoftRiver_01` off its own normal, `MrFreeze` off `N_ice`.
+Because `water_substitute` only fires where a material resolves to no colour,
+this *unblocks* it: CTF-Reflection goes from none to six stock water surfaces.
+
+*The pool was a placeholder: a mover, and a name up the chain.* Two gaps.
+`water_substitute` was only ever called from `convert_actors`, so movers never
+tried it -- and BL-Dekk's landing pool is an `InterpActor`. And it tests the
+*leaf* material's name, which Matinee builds one of per animated parameter and
+calls `MaterialInstanceConstant_835`. The identity is up the chain:
+
+    MaterialInstanceConstant_835 <- ... <- M_LiquidEden_VertexOffset_INST
+                                        <- M_LiquidEden_INST
+
+`_chain_substitute` walks it, and `_make_mover` now takes the texture set and
+applies the skin.
+
+Rebuilt, the four actors read:
+
+    StaticMeshActor_230   Shader: tinted diffuse + additive bubble glow
+    StaticMeshActor_2993  Skins(0) ColorModifier, no TexPanner (the housing)
+                          Skins(1) Shader: (209,228,255) diffuse, (63,160,255) glow
+    InterpActor_6         FinalBlend'UCGeneric.Glass.glass06_finalblend'
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes

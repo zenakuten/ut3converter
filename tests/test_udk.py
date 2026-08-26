@@ -20,7 +20,7 @@ from convert.textures import TextureSet
 from ut2 import dxt
 from ut3.objects.material import (_LAST_SAMPLE, declared_diffuse_channel,
                                   material_albedo, material_panner,
-                                  resolve_diffuse)
+                                  resolve_diffuse, resolve_emissive)
 from ut3.objects.staticmesh import read_static_mesh, validate
 from ut3.objects.texture import read_texture
 from ut3.resolve import PackageIndex
@@ -185,6 +185,74 @@ def main(content):
             check_that("so the waterfall still scrolls",
                        panner is not None and abs(panner[1] - 0.0608) < 0.001,
                        str(panner))
+
+    if dekk is not None:
+        print("BL-Dekk's lights, liquid and pool")
+        from convert.shaders import _chain_substitute
+        from ut3.objects.material import diffuse_tint, emissive_tint
+        from ut3.props import read_object_properties
+
+        by_name = {}
+        for i, export in enumerate(dekk.exports):
+            if dekk.class_name_of(export) != "StaticMeshComponent":
+                continue
+            props, start, _e = read_object_properties(dekk, export)
+            if start is None:
+                continue
+            array = props.get("Materials")
+            if array is None:
+                continue
+            for entry in array.as_objects():
+                if entry is not None and not entry.is_null:
+                    by_name.setdefault(str(entry).split(".")[-1].rstrip("'"), entry)
+
+        ts = TextureSet("X")
+        # The lamp's EmissiveColor hangs off a MaterialExpressionLightmassReplace,
+        # whose Realtime input is what the game draws and whose Lightmass input is
+        # what the baker sees. Following neither, the walk found nothing and the
+        # fixtures had no glow at all.
+        lamp = by_name.get("SF_M_Light_rail_INST")
+        _owner, glow = resolve_emissive(dekk, index, lamp, reject=ts._unusable_glow)
+        check_that("a lamp behind a LightmassReplace still finds its glow",
+                   glow is not None, glow.name if glow else "none")
+        # And the glow's colour is not the diffuse's: the material states
+        # DiffuseColor for the housing it lights and LightColor for what it emits.
+        check("the housing takes DiffuseColor", diffuse_tint(dekk, index, lamp),
+              (209, 228, 255))
+        check("the glow takes LightColor", emissive_tint(dekk, index, lamp),
+              (63, 160, 255))
+
+        # A texture that came from a TextureParameterValues override is drawn by
+        # the sample that reads that parameter, so that sample's coordinates --
+        # including their absence -- are the authority. Without it the fallback
+        # found a Panner on a layer that is never drawn and the fixtures' housings
+        # slid sideways.
+        rails = by_name.get("MF_M_Rails_INST")
+        if rails is not None:
+            check("an overridden texture does not inherit a stray Panner",
+                  material_panner(dekk, index, rails), None)
+
+        # A colour input that samples nothing is an answer: M_LiquidEdenGlass
+        # computes its water colour and hangs its bubbles off EmissiveColor, and
+        # painting the pipe with the bubble overlay is DM-Dekk's black water.
+        pipe = by_name.get("M_LiquidEdenGlass_SphereCorrected_INST")
+        if pipe is not None:
+            _o, tex = resolve_diffuse(dekk, index, pipe)
+            check_that("a liquid is not painted with its bubble overlay",
+                       tex is None or tex.name != "SF_T_TilingBubbles_M",
+                       tex.name if tex else "no texture")
+            _go, bubbles = resolve_emissive(dekk, index, pipe,
+                                            reject=ts._unusable_glow)
+            check("the bubbles become its glow instead",
+                  bubbles.name if bubbles else None, "SF_T_TilingBubbles_M")
+
+        # Matinee names an instance per animated parameter, so the leaf says
+        # nothing; the identity is up the chain.
+        pool = by_name.get("MaterialInstanceConstant_835")
+        if pool is not None:
+            check_that("a liquid is recognised through its instance chain",
+                       _chain_substitute(dekk, index, pool) is not None,
+                       str(_chain_substitute(dekk, index, pool)))
 
     if _failures:
         print("%d check(s) failed: %s" % (len(_failures), ", ".join(_failures)))

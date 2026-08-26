@@ -80,7 +80,8 @@ non-opaque blend mode, and no DiffuseColor input at all:
 """
 
 from ut3.objects.material import (MASKED_BLEND, constant_colour, diffuse_scale,
-                                  diffuse_tint, material_panner, opacity_scale)
+                                  diffuse_tint, emissive_tint, material_panner,
+                                  opacity_scale)
 from ut3.props import read_object_properties
 
 # Blend modes that, combined with unlit shading, mark a volumetric effect.
@@ -292,6 +293,38 @@ def _material_candidates(pkg, index, mesh_ref, overrides, cache=None):
         yield owner, ref
 
 
+def _chain_substitute(pkg, index, ref, depth=8):
+    """`_substitute_for` applied up the instance chain, not just at the leaf.
+
+    A leaf's name is often not the material's identity. Matinee builds one per
+    animated parameter and calls it `MaterialInstanceConstant_835`, which says
+    nothing -- but BL-Dekk's landing pool runs
+
+        MaterialInstanceConstant_835 <- ... <- M_LiquidEden_VertexOffset_INST
+                                            <- M_LiquidEden_INST
+
+    and "Liquid" is right there once the walk goes past the leaf. The pool was
+    coming out as the checkerboard placeholder, its albedo resolving to
+    `SF_T_TilingBubbles_N_H` and being refused as a normal map -- correctly, and
+    with nothing left to draw.
+    """
+    while depth > 0 and ref is not None and not ref.is_null:
+        owner, export = index.resolve(pkg, ref)
+        if export is None:
+            return None
+        found = _substitute_for(export.name, MATERIAL_SUBSTITUTES)
+        if found:
+            return found
+        props, start, _end = read_object_properties(owner, export)
+        if start is None:
+            return None
+        parent = props.get("Parent")
+        if parent is None or parent.is_null:
+            return None
+        pkg, ref, depth = owner, parent, depth - 1
+    return None
+
+
 def water_substitute(pkg, index, mesh_ref, overrides, rotation, texture_set, cache=None):
     """A stock UT2004 water material for a surface that would otherwise be grey.
 
@@ -323,7 +356,7 @@ def water_substitute(pkg, index, mesh_ref, overrides, rotation, texture_set, cac
         _material_owner, material = index.resolve(owner, ref)
         if material is None:
             continue
-        found = _substitute_for(material.name, MATERIAL_SUBSTITUTES)
+        found = _chain_substitute(owner, index, ref)
         if not found:
             continue
         # add_material caches by material, so asking here costs nothing that
@@ -595,7 +628,22 @@ def build_material(material_set, texture_set, pkg, index, ref,
                 # one (max 237), and at the mask's mid-tones the lerp drew about
                 # 40 where UT3 draws 100. Reported as StaticMeshActor_641 being
                 # "ok but not glowing".
-                shader.append(("Specular", "Texture'%s'" % glow_path))
+                glow_kind, glow_current = "Texture", glow_path
+                glow_colour = emissive_tint(pkg, index, ref)
+                if glow_colour is not None:
+                    # The glow's own colour, which is not the diffuse's: a lamp
+                    # states DiffuseColor for the housing it lights and
+                    # LightColor for what it emits. It goes on the glow alone,
+                    # so it has to wrap the texture here rather than the Shader.
+                    inner_glow = material_set.add("ColorModifier", base_name, [
+                        ("Material", "%s'%s'" % (glow_kind, glow_current)),
+                        ("Color", _color(glow_colour)),
+                        ("AlphaBlend", "False"),
+                        ("RenderTwoSided", "False"),
+                    ])
+                    glow_kind = "ColorModifier"
+                    glow_current = material_set.bare_path(inner_glow)
+                shader.append(("Specular", "%s'%s'" % (glow_kind, glow_current)))
             if unlit:
                 shader.append(("SelfIllumination", "%s'%s'" % (kind, current)))
             if framebuffer is None and blend == MASKED_BLEND:

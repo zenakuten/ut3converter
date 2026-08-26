@@ -41,6 +41,7 @@ import math
 
 from ut2.t3d import Actor, vec
 from convert.curve import played_range, read_vector_curve, sample
+from convert.shaders import water_substitute
 from ut3.objects.level import ordered_exports
 from ut3.props import read_object_properties
 
@@ -555,7 +556,7 @@ def convert_movers(pkg, index, mesh_set, texture_set=None, scale=1.0, stats=None
                                 state=actor_state, tag=actor_tag, slave=slave,
                                 opening_event=(part_tag if is_lift and not is_follower
                                                and followers else None),
-                                timed=is_lift)
+                                timed=is_lift, texture_set=texture_set)
             if actor is None:
                 # Animated or not, an unlit translucent effect mesh has no UE2
                 # equivalent -- DM-HeatRay's wobbling light beams would arrive as
@@ -590,7 +591,7 @@ def convert_movers(pkg, index, mesh_set, texture_set=None, scale=1.0, stats=None
 def _make_mover(pkg, index, export, mesh_set, key_pos, key_rot, move_time, track,
                 scale, names, component_of, material_overrides, sanitize,
                 is_effect=None, effect_cache=None, state=DORMANT_STATE, tag=None,
-                slave=False, opening_event=None, timed=False):
+                slave=False, opening_event=None, timed=False, texture_set=None):
     props = _props(pkg, export)
     if props is None:
         return None
@@ -602,6 +603,17 @@ def _make_mover(pkg, index, export, mesh_set, key_pos, key_rot, move_time, track
         return None
     if is_effect is not None and is_effect(pkg, index, mesh_ref, effect_cache):
         return None
+    # A liquid sheet is procedural in UT3 and resolves to no colour at all, so
+    # without this a moving pool is the checkerboard placeholder -- BL-Dekk's
+    # landing pool is an InterpActor. The same rule convert_actors applies, and
+    # for the same reasons: see convert/shaders.py water_substitute.
+    water = None
+    if texture_set is not None:
+        rot_prop = props.get("Rotation") if props is not None else None
+        water = water_substitute(
+            pkg, index, mesh_ref, material_overrides(pkg, comp),
+            tuple(rot_prop.value) if rot_prop is not None and rot_prop.value
+            else (0, 0, 0), texture_set)
     mesh_name = mesh_set.add(pkg, index, mesh_ref, material_overrides(pkg, comp))
     if mesh_name is None:
         return None
@@ -610,6 +622,8 @@ def _make_mover(pkg, index, export, mesh_set, key_pos, key_rot, move_time, track
         ("StaticMesh", "StaticMesh'%s.%s'" % (mesh_set.package_name, mesh_name)),
         ("DrawType", "DT_StaticMesh"),
     ]
+    if water is not None:
+        properties.append(("Skins(0)", water))
     location = props.get("Location")
     if location is not None and location.value:
         properties.append(("Location", vec([c * scale for c in location.value])))
