@@ -54,14 +54,21 @@ def compress(system, folder, filename):
     return result.returncode == 0
 
 
-def package(entry, out_folder, force=False):
-    """Copy one map's two files into the output folder and compress each."""
+def package(entry, out_folder, force=False, map_only=False):
+    """Copy one map's two files into the output folder and compress each.
+
+    `map_only` ships the .ut2 alone. A converter change that moves only actor
+    properties -- an ambient's SoundVolume, a Skins reference -- rewrites the
+    .t3d and leaves the package identical, and recompressing 150MB of textures
+    to prove it costs minutes. The .utx already in the folder still matches.
+    """
     _path, base, name, tex = entry
     maps = os.path.join(batch.EDITOR, "Maps", name + ".ut2")
     textures = os.path.join(batch.EDITOR, "Textures", tex + ".utx")
     out = os.path.join(batch.EDITOR, out_folder)
 
-    for source in (maps, textures):
+    wanted = (maps,) if map_only else (maps, textures)
+    for source in wanted:
         if not os.path.isfile(source):
             missing = os.path.relpath(source, batch.EDITOR)
             if source is maps:
@@ -83,7 +90,7 @@ def package(entry, out_folder, force=False):
 
     os.makedirs(out, exist_ok=True)
     print("  %s" % base)
-    for source in (maps, textures):
+    for source in wanted:
         filename = os.path.basename(source)
         destination = os.path.join(out, filename)
         archive = destination + ".uz2"
@@ -128,6 +135,9 @@ def main():
     parser.add_argument("--folder", default=DEFAULT_FOLDER,
                         help="output folder under the editor install (default: %s)"
                              % DEFAULT_FOLDER)
+    parser.add_argument("--map-only", action="store_true",
+                        help="ship the .ut2 alone, leaving the .utx already in "
+                             "the folder -- for a change that moved only the t3d")
     parser.add_argument("--force", action="store_true",
                         help="package a .ut2 that is older than its .t3d")
     args = parser.parse_args()
@@ -145,7 +155,8 @@ def main():
         return 0
 
     print("packaging into %s/%s" % (batch.EDITOR, args.folder))
-    done = [package(entry, args.folder, args.force) for entry in entries]
+    done = [package(entry, args.folder, args.force, args.map_only)
+            for entry in entries]
     print("\n%d of %d packaged" % (sum(done), len(done)))
     return 0 if all(done) else 1
 

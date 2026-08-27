@@ -2358,6 +2358,12 @@ beds going 210 -> 82 -> 33 and the map's whole range landing in 10..38. The
 package is untouched, volume being a per-actor property in the .t3d, so only the
 .ut2 needs rebuilding.
 
+That is common enough to be worth a flag: `tools/package_maps.py --map-only`
+ships the .ut2 alone and leaves the .utx already in the folder. A change that
+moves only actor properties -- an ambient's SoundVolume, a Skins reference --
+leaves the package byte-identical, and recompressing 150MB of textures to prove
+it costs minutes.
+
 *Not a formula error, a reference error.* The radius mapping either side of it is
 unchanged and still earns its own paragraph above; what was wrong was the single
 constant deciding what "full" means, and the engine states that in a comment
