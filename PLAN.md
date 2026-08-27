@@ -2328,6 +2328,34 @@ repeatable.
 
     ./batch.py --match Dekk --flag "--max-texture-size 2048" --build
 
+**Phase 29 -- ambient sounds were twice as loud as UT2004's own.** Reported on
+DM-Dekk, whose 112 ambients came out between 204 and 229.
+
+`UT2_VOLUME_FULL = 255` was the obvious reading and the wrong one.
+`GetAmbientVolume` does divide by 255 -- but the whole line is
+
+    Attenuation * SoundVolume / 255.f / 2.f   // volume is now in range 0..2
+
+(UnActor.cpp:136, :138, Epic's comment). The byte is not a fraction of unity:
+255 is *half* the engine's internal range, and mapping UE3's 1.0 onto it puts
+every ambient at the top of what the property can express.
+
+What UT2004 itself calls a normal ambient is the **100** that `AmbientSound.uc`
+ships as its default -- an AmbientSound placed in UnrealEd and left alone plays
+at that. So UE3's 1.0 lands on 100 now (`UT2_VOLUME_UNITY`), while the clamp
+keeps the 255 ceiling (`UT2_VOLUME_MAX`) so `--sound-gain` above 1.0 still has
+somewhere to go.
+
+DM-Dekk reconverted: exactly **112 lines change and nothing else**, its main beds
+dropping from 210 to 82 and its loudest from 229 to 90 -- a shade under what the
+engine's own class would play. The package is untouched, the volume being a
+per-actor property in the .t3d, so only the .ut2 needs rebuilding.
+
+*Not a formula error, a reference error.* The radius mapping either side of it is
+unchanged and still earns its own paragraph above; what was wrong was the single
+constant deciding what "full" means, and the engine states that in a comment
+rather than in the divisor.
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes

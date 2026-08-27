@@ -123,7 +123,11 @@ def main(path):
     wind_actor = [a for a in actors if a.sound_names == ["stereo_wind04"]][0]
     check("the map-wide wind bed keeps its reach",
           round(float(prop_of(wind_actor, "SoundRadius"))), 46669)
-    check("its volume follows UT3's 0.68", int(prop_of(wind_actor, "SoundVolume")), 173)
+    # UE3's 1.0 lands on 100, the default AmbientSound.uc ships -- see
+    # UT2_VOLUME_UNITY. Mapping it to 255 instead read as full scale but is half
+    # the engine's internal range, and DM-Dekk's 112 ambients came out twice as
+    # loud as an untouched UT2004 AmbientSound would play.
+    check("its volume follows UT3's 0.68", int(prop_of(wind_actor, "SoundVolume")), 68)
 
     print("one-shot emitters")
     # UE3 draws one of 13 traffic flybys every 1..5 seconds. UT2004 runs each

@@ -63,10 +63,25 @@ UT2_PITCH_UNITY = 64
 UT2_PITCH_MIN = 32
 UT2_PITCH_MAX = 128
 
-# UE3 volume 1.0 becomes this UT2004 SoundVolume. GetAmbientVolume divides by
-# 255 (UnActor.cpp:138), so this is a straight full-scale mapping.
+# What UE3 volume 1.0 becomes, and the byte ceiling it is clamped to.
+#
+# 255 was the obvious reading -- `GetAmbientVolume` divides by 255
+# (UnActor.cpp:138), so full scale to full scale -- and it is too loud by about
+# a factor of two. The line it divides by is
+#
+#     Attenuation * SoundVolume / 255.f / 2.f   // volume is now in range 0..2
+#
+# so the byte is not a fraction of unity at all; 255 is half of the engine's
+# internal range, and what UT2004 itself calls a normal ambient is the 100 that
+# `AmbientSound.uc` ships as its default. That is the reference used here: an
+# AmbientSound placed in UnrealEd and left alone plays at 100, so UE3's 1.0
+# lands there too. Reported on DM-Dekk, whose 112 ambients came out between 204
+# and 229 -- twice what the engine's own class would have played.
+#
+# The ceiling stays 255, so `--sound-gain` above 1.0 still has somewhere to go.
 DEFAULT_VOLUME_GAIN = 1.0
-UT2_VOLUME_FULL = 255
+UT2_VOLUME_UNITY = 100
+UT2_VOLUME_MAX = 255
 
 FFMPEG = "ffmpeg"
 
@@ -269,8 +284,8 @@ def _levels(owner, index, node, volume_gain):
     pitch *= pitch_scale
 
     radius = sound_radius(min_radius, max_radius)
-    sound_volume = max(1, min(UT2_VOLUME_FULL,
-                              int(round(UT2_VOLUME_FULL * volume * volume_gain))))
+    sound_volume = max(1, min(UT2_VOLUME_MAX,
+                              int(round(UT2_VOLUME_UNITY * volume * volume_gain))))
     sound_pitch = max(UT2_PITCH_MIN, min(UT2_PITCH_MAX,
                                          int(round(UT2_PITCH_UNITY * pitch))))
     return radius, sound_volume, sound_pitch
