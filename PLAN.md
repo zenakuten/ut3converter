@@ -2395,6 +2395,58 @@ unchanged and still earns its own paragraph above; what was wrong was the single
 constant deciding what "full" means, and the engine states that in a comment
 rather than in the divisor.
 
+**Phase 30 -- letting a mapper rename a converted pair.** Asked for: someone
+takes `DM-Dekk.ut2` and `BLDekkTex.utx`, fixes things by hand, and wants to ship
+the result under names of their own without the map still loading the original
+package. `tools/repoint_package.py`.
+
+    ./tools/repoint_package.py --list DM-Dekk.ut2
+    ./tools/repoint_package.py BLDekkTex DekkTexV9 DM-Dekk-v9.ut2 DekkTexV9.utx
+
+Two things about it were only learnt by trying, and both are the interesting
+part.
+
+*Renaming the .utx file is not enough, and neither is renaming the map.* A UE2
+package does not record its own name -- the filename is the name -- so the .utx
+side looks like a `mv`. It is not, because the converter builds its package from
+a generated script class of the same name, so the map imports **`Class
+BLDekkTex.BLDekkTex`**: the class as well as the package. Rename only the map and
+UT2004 says
+
+    Failed import: Class Class DekkTexV1.DekkTexV1 (file ../Textures/DekkTexV1.utx)
+    Failed loading package: Can't find Class in file Class DekkTexV1.DekkTexV1
+
+because the .utx still calls its class the old thing. The name has to change in
+both files, which is why the tool takes a list of them rather than a map.
+
+*The new name must be exactly as long as the old.* Everything is referenced by
+name *index*, so the string itself can change freely, and the first attempt
+rewrote the table at whatever length and moved everything after it:
+
+    header 0..64 | names | export data | imports | export table
+
+`ImportOffset`, `ExportOffset` and every export's `SerialOffset` were moved to
+match, the export table re-encoded (compact indices, and it is last in the file
+so its own size does not matter), and every export payload verified byte for
+byte. UT2004 still refused to load it -- while a **same-length** rename of the
+same file, differing in nine bytes and nothing else, loads. So something inside
+export data carries an absolute file position; UE2's `TLazyArray` writes the
+offset it can skip to, and finding those needs the serialisation of every class.
+The length is a hard constraint rather than a limitation worth working around,
+and the tool refuses a mismatch with the reason.
+
+Verified end to end with `ucc dumpint` on a renamed pair -- failing when only the
+map is renamed, succeeding when both are -- against an unrenamed copy under a new
+filename as the control, which loads, so the filename was never the issue.
+`tests/test_repoint.py` covers the compact-index codec, the name-table
+round-trip, the length refusal and the absent-name refusal; it skips cleanly
+where no built map is to hand.
+
+*Worth saying to whoever uses it:* pick a replacement without a hyphen.
+`BLDekkTex` is nine characters and so must its successor be, and a name like
+`DekkTexV9` stays safe in the text contexts -- .uc `#exec` lines, T3D object
+references -- where a hyphen would need quoting.
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes
