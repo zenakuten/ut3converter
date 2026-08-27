@@ -261,13 +261,15 @@ def flags_for(base):
     return flags
 
 
-def convert(entry, dry_run=False):
+def convert(entry, dry_run=False, extra=()):
     path, base, name, package = entry
     folder = os.path.join(HERE, "out-" + name.lower())
     os.makedirs(folder, exist_ok=True)
     target = os.path.join(folder, name + ".t3d")
+    # Last wins in argparse, so anything passed with --flag overrides the
+    # per-map entry in EXTRA_FLAGS rather than fighting it.
     command = [sys.executable, os.path.join(HERE, "ut3conv.py"), "t3d", path,
-               "-o", target] + flags_for(base)
+               "-o", target] + flags_for(base) + list(extra)
     if dry_run:
         print("      " + " ".join(command[2:]))
         return None
@@ -409,6 +411,10 @@ def build_parser():
                         help="print each step without doing any of it")
     parser.add_argument("--skip-converted", action="store_true",
                         help="skip maps whose t3d is already in the editor folder")
+    parser.add_argument("--flag", action="append", default=[], metavar="ARGS",
+                        help="extra ut3conv flags for every map, split on spaces "
+                             "and appended after the per-map ones, so they win. "
+                             "Repeatable. Example: --flag '--max-texture-size 2048'")
     return parser
 
 
@@ -447,17 +453,20 @@ def main():
 
 def run(entries, args):
     failed = []
+    extra = [token for chunk in getattr(args, "flag", []) or [] for token in chunk.split()]
+    if extra:
+        print("extra flags for every map: %s" % " ".join(extra))
     for number, entry in enumerate(entries, 1):
         _path, base, name, package = entry
         print("[%d/%d] %s -> %s (%s)" % (number, len(entries), base, name, package))
         if args.dry_run:
-            convert(entry, True)
+            convert(entry, True, extra)
             if args.build:
                 print("      EditPackages=%s ; rm %s.u ; ./UCC.exe make ; cp -> %s.utx"
                       % (package, package, package))
             continue
 
-        target = convert(entry)
+        target = convert(entry, extra=extra)
         if not target:
             failed.append(base)
             continue

@@ -26,8 +26,22 @@ from ut3.objects.texture import read_texture
 
 _SANITIZE = re.compile(r"[^A-Za-z0-9_]")
 
-# UT2004 handles 2048 but 1024 is the practical ceiling for a UE2 world texture.
-DEFAULT_MAX_SIZE = 1024
+# The largest mip exported. Raised from 1024 after measuring what the source
+# content actually holds: a third of every texture the 12 TOXIKK maps use is
+# larger than 1024, 84 distinct ones, and the top mip is genuinely present in
+# every case rather than streamed out the way UT3's cooked packages leave it. At
+# 1024 all of those shipped a mip level down.
+#
+# The cost is package size and video memory, both roughly doubling for a map
+# built mostly of 2048s -- BL-Dekk's went from 82MB to 160MB. UT2004 itself has
+# no trouble with either, and `--max-texture-size` is there for a map or a
+# machine that does.
+#
+# It also moves the .t3d: the BSP writer derives each surface's UV scale from the
+# size the texture actually ships at, so raising the cap doubles every TextureU
+# and TextureV that gains a mip. A .t3d and its package are a matched pair --
+# loading one against a package built at a different cap tiles the BSP wrong.
+DEFAULT_MAX_SIZE = 4096
 
 # UE3 normalises BSP surface UVs by a fixed constant instead of by the texture
 # size, which is why its |TextureU| values cluster on 1, 1/2, 1/3, 1/4 whatever

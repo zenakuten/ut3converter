@@ -2285,6 +2285,49 @@ Rebuilt, the four actors read:
                           Skins(1) Shader: (209,228,255) diffuse, (63,160,255) glow
     InterpActor_6         FinalBlend'UCGeneric.Glass.glass06_finalblend'
 
+**Phase 28 -- the texture cap was throwing away a mip TOXIKK actually ships.**
+Asked whether any TOXIKK textures are larger than 1024. A third of them are.
+
+Across the 12 TOXIKK maps, 257 of 769 map-texture pairs exceed 1024 in one
+dimension -- **84 distinct textures**, 71 of them 2048x2048, plus a 4096x4096
+(`lowpolyVersion_color`) and a 4096x1024 (`T_NightSkydome`). And the top mip is
+genuinely *present* in every case: the declared `Texture2D` size and the largest
+mip carrying payload match for all 769, unlike UT3's cooked packages where the
+top mip is streamed out and absent. At `DEFAULT_MAX_SIZE = 1024` every one of
+those shipped a level down, and the 4096s two.
+
+So the default is 4096 now. It is close to a no-op outside TOXIKK, which is what
+makes it safe -- measured on the largest mip actually present:
+
+    BL-Dekk            28 of  73        DM-HeatRay          3 of 161
+    CC-Foundation_XL   38 of 103        MP_Courtyard        4 of 336
+    BL-Foundation      35 of  92        DM-Deck             1 of  85
+    CC-Citadel         26 of  64        WAR-PowerSurge      0 of 109
+
+UT3's cookers had already made the decision for us; TOXIKK's did not.
+
+*What it costs.* BL-Dekk rebuilt at the new default: **82MB -> 160MB** for the
+package, 29 of its 75 exported textures now over 1024 (23 at 2048x2048), and the
+`.uz2` a client downloads goes **35MB -> 63MB**. Video memory roughly doubles
+too. `--max-texture-size` is still there for a map or a machine that cannot take
+it.
+
+*And it moves the .t3d.* The BSP writer derives each surface's UV scale from the
+size the texture actually ships at -- that is Phase 5's rule, UE3 normalising
+BSP UVs by a fixed constant where UE2 states them against the texture. Raising
+the cap doubled 1,368 `TextureU`/`TextureV` values on BL-Dekk, one for every
+surface wearing a texture that gained a mip. **A .t3d and its package are a
+matched pair**: loading one against a package built at a different cap tiles
+every affected BSP surface wrong. `batch.py` regenerates both together, so this
+only bites if the two are built separately.
+
+*`batch.py --flag`.* Trying this needed a way to pass a ut3conv flag through for
+one run without editing `EXTRA_FLAGS`. `--flag` takes a string, splits it on
+spaces and appends it after the per-map flags, so it wins on a conflict; it is
+repeatable.
+
+    ./batch.py --match Dekk --flag "--max-texture-size 2048" --build
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes

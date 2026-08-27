@@ -150,8 +150,17 @@ def main(path):
         check_that("so it leaves its surfaces alone",
                    texture_set.scale_for(None) == (1.0, 1.0))
         sizes = {n: v[0] for n, v in texture_set.exported_size.items()}
+        # This export asked for 1024 explicitly; the shipped default is higher.
         check_that("nothing was exported above the cap",
                    max(sizes.values()) <= 1024, "largest %d" % max(sizes.values()))
+        # Raised from 1024 after measuring the source content: a third of every
+        # texture the 12 TOXIKK maps use is larger than that, 84 distinct ones,
+        # with the top mip genuinely present rather than streamed out. UT3's own
+        # maps barely notice -- 3 of DM-HeatRay's 161, 1 of DM-Deck's 85, none of
+        # WAR-PowerSurge's 109 -- because their cookers did stream it out.
+        from convert.textures import DEFAULT_MAX_SIZE
+
+        check("the shipped cap is 4096", DEFAULT_MAX_SIZE, 4096)
         # The case that made this visible: a 2048 brick reduced to 1024. UT3
         # gives it |TextureU| 0.25 for a 512uu repeat; 1024/128 = 8 restates
         # that as 2.0, which is 1024/2.0 = the same 512uu.

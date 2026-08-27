@@ -29,6 +29,7 @@ import sys
 
 from ut3.package import Package
 from convert.terrain import DEFAULT_DECO_DENSITY
+from convert.textures import DEFAULT_MAX_SIZE
 
 HALF_WORLD_MAX = 262144.0
 
@@ -1044,8 +1045,8 @@ def build_parser():
                          "which is the only place ucc make can build it from")
     sp.add_argument("--no-package", action="store_true",
                     help="emit only the .t3d, with no buildable asset package")
-    sp.add_argument("--max-texture-size", type=int, default=1024,
-                    help="largest mip to export (default 1024)")
+    sp.add_argument("--max-texture-size", type=int, default=DEFAULT_MAX_SIZE,
+                    help="largest mip to export (default %d)" % DEFAULT_MAX_SIZE)
     sp.add_argument("--no-meshes", action="store_true",
                     help="omit static meshes (requires --textures otherwise)")
     sp.add_argument("--no-terrain", action="store_true", help="omit converted terrain")
@@ -1163,7 +1164,7 @@ def build_parser():
     sp.add_argument("-o", "--output", default=install_root(),
                     help="where to write the package (default: the UT2004 install root)")
     sp.add_argument("--texture-package", help="name for the generated package")
-    sp.add_argument("--max-texture-size", type=int, default=1024)
+    sp.add_argument("--max-texture-size", type=int, default=DEFAULT_MAX_SIZE)
     sp.set_defaults(func=cmd_textures)
 
     sp = sub.add_parser("imports", help="list imports")
