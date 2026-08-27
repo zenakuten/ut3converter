@@ -2346,10 +2346,17 @@ at that. So UE3's 1.0 lands on 100 now (`UT2_VOLUME_UNITY`), while the clamp
 keeps the 255 ceiling (`UT2_VOLUME_MAX`) so `--sound-gain` above 1.0 still has
 somewhere to go.
 
-DM-Dekk reconverted: exactly **112 lines change and nothing else**, its main beds
-dropping from 210 to 82 and its loudest from 229 to 90 -- a shade under what the
-engine's own class would play. The package is untouched, the volume being a
-per-actor property in the .t3d, so only the .ut2 needs rebuilding.
+**And 100 was still wrong.** Rebuilt and listened to, DM-Dekk was about two and a
+half times too loud again, so the reference is **40**. That part is calibration,
+not derivation: no engine constant says 40. What it reflects is that UT3 mixes an
+ambient bed far quieter against everything else than UE2 does, and reading either
+engine's source cannot reconcile the two -- doing better would need the two games
+playing the same wave side by side with a meter on the output.
+
+DM-Dekk reconverted: **112 lines change and nothing else** either time, its main
+beds going 210 -> 82 -> 33 and the map's whole range landing in 10..38. The
+package is untouched, volume being a per-actor property in the .t3d, so only the
+.ut2 needs rebuilding.
 
 *Not a formula error, a reference error.* The radius mapping either side of it is
 unchanged and still earns its own paragraph above; what was wrong was the single

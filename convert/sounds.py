@@ -66,21 +66,28 @@ UT2_PITCH_MAX = 128
 # What UE3 volume 1.0 becomes, and the byte ceiling it is clamped to.
 #
 # 255 was the obvious reading -- `GetAmbientVolume` divides by 255
-# (UnActor.cpp:138), so full scale to full scale -- and it is too loud by about
-# a factor of two. The line it divides by is
+# (UnActor.cpp:138), so full scale to full scale -- and it is badly too loud.
+# The line it divides by is
 #
 #     Attenuation * SoundVolume / 255.f / 2.f   // volume is now in range 0..2
 #
-# so the byte is not a fraction of unity at all; 255 is half of the engine's
-# internal range, and what UT2004 itself calls a normal ambient is the 100 that
-# `AmbientSound.uc` ships as its default. That is the reference used here: an
-# AmbientSound placed in UnrealEd and left alone plays at 100, so UE3's 1.0
-# lands there too. Reported on DM-Dekk, whose 112 ambients came out between 204
-# and 229 -- twice what the engine's own class would have played.
+# so the byte is not a fraction of unity at all: 255 is half of the engine's
+# internal range. That reading got the number down to 100, the default
+# `AmbientSound.uc` ships, on the reasoning that an AmbientSound placed in
+# UnrealEd and left alone plays at that.
 #
-# The ceiling stays 255, so `--sound-gain` above 1.0 still has somewhere to go.
+# 40 is where it actually sits, and that part is calibration rather than
+# derivation -- DM-Dekk was rebuilt and listened to at 100 and it was still
+# roughly two and a half times too loud. No engine constant says 40; what it
+# reflects is that UT3 mixes an ambient bed far quieter against everything else
+# than UE2 does, and the two cannot be reconciled by reading either engine's
+# source. Anything better than a number arrived at by ear would need the two
+# games playing the same wave side by side with a meter on the output.
+#
+# `--sound-gain` scales relative to this, and the ceiling stays 255 so a value
+# above 1.0 still has somewhere to go.
 DEFAULT_VOLUME_GAIN = 1.0
-UT2_VOLUME_UNITY = 100
+UT2_VOLUME_UNITY = 40
 UT2_VOLUME_MAX = 255
 
 FFMPEG = "ffmpeg"
