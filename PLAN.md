@@ -2346,7 +2346,33 @@ at that. So UE3's 1.0 lands on 100 now (`UT2_VOLUME_UNITY`), while the clamp
 keeps the 255 ceiling (`UT2_VOLUME_MAX`) so `--sound-gain` above 1.0 still has
 somewhere to go.
 
-**And 100 was still wrong.** Rebuilt and listened to, DM-Dekk was about two and a
+**And 40 was still wrong; it is 13.** Which is the point at which the constant
+stops being a level and starts being a symptom -- see the note in
+`convert/sounds.py`, and the radius arithmetic below.
+
+*Is the radius wrong instead?* Asked, and measured. DM-Dekk's ambients state
+their own `RadiusMin`/`RadiusMax` rather than taking the 400/5000 defaults, and
+the median pair is **85 and 220** -- tight, local sounds. The current rule,
+matching UE3's half-volume distance, gives `SoundRadius` 74, and at 220uu, where
+UT3 plays *nothing*, UE2 is still at **27%** and keeps playing out to
+**7,413uu** (100 x SoundRadius) across a map 28,000uu wide. All 112 sound at
+once from most of the level, and their sum is what is loud.
+
+No radius fixes that on its own. UE2's `gain = SoundRadius / distance` cannot be
+as tight as a logarithmic curve that reaches zero over a 2.6:1 ratio: any radius
+big enough to play at full volume near the source is at roughly 1/2.6 of it
+where UT3 is silent. Matching UE3's *plateau* instead (SoundRadius = MinRadius)
+is slightly worse, not better -- 85, 30%, 8,480uu.
+
+And scaling the radius down while scaling volume up by the same factor changes
+**nothing** in the far field, both being proportional to radius x volume. The one
+thing it does change is the engine's hard cutoff at 100 x SoundRadius: shrink the
+radius sevenfold and each sound stops dead at 1,100uu instead of 7,413uu, so far
+fewer of the 112 reach the listener at all while the near field stays put. That
+-- matching UE3's silence point to UE2's *cutoff* rather than to its half-volume
+point -- is the fix worth trying if the volume constant has to move again.
+
+**Before that, 100 was still wrong.** Rebuilt and listened to, DM-Dekk was about two and a
 half times too loud again, so the reference is **40**. That part is calibration,
 not derivation: no engine constant says 40. What it reflects is that UT3 mixes an
 ambient bed far quieter against everything else than UE2 does, and reading either
@@ -2354,7 +2380,7 @@ engine's source cannot reconcile the two -- doing better would need the two game
 playing the same wave side by side with a meter on the output.
 
 DM-Dekk reconverted: **112 lines change and nothing else** either time, its main
-beds going 210 -> 82 -> 33 and the map's whole range landing in 10..38. The
+beds going 210 -> 82 -> 33 -> 11, the map's whole range landing in 3..12. The
 package is untouched, volume being a per-actor property in the .t3d, so only the
 .ut2 needs rebuilding.
 

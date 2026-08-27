@@ -76,18 +76,30 @@ UT2_PITCH_MAX = 128
 # `AmbientSound.uc` ships, on the reasoning that an AmbientSound placed in
 # UnrealEd and left alone plays at that.
 #
-# 40 is where it actually sits, and that part is calibration rather than
-# derivation -- DM-Dekk was rebuilt and listened to at 100 and it was still
-# roughly two and a half times too loud. No engine constant says 40; what it
-# reflects is that UT3 mixes an ambient bed far quieter against everything else
-# than UE2 does, and the two cannot be reconciled by reading either engine's
-# source. Anything better than a number arrived at by ear would need the two
-# games playing the same wave side by side with a meter on the output.
+# 13 is where it actually sits, and that part is calibration rather than
+# derivation -- DM-Dekk was rebuilt and listened to at 100, then at 40, and was
+# still too loud both times. No engine constant says 13.
+#
+# What is behind the number is the *tails*, not the levels. UE3's logarithmic
+# falloff reaches exactly zero at MaxRadius; UE2's is gain = SoundRadius /
+# distance, which never reaches zero and only stops when the engine gives up at
+# 100 * SoundRadius (GAudioMaxRadiusMultiplier, Core/Src/Core.cpp:179). DM-Dekk
+# places 112 ambients with a median SoundRadius of 47, so each is inaudible in
+# UT3 within a few hundred units and still whispering here 4,700 units away,
+# across a map 28,000 units wide. Almost all 112 sound at once from anywhere you
+# stand, and it is their sum that is loud rather than any one of them.
+#
+# So this constant is paying for a shape mismatch, which is why it has had to go
+# so low. Shortening the radii instead would fix the cause -- see the radius
+# note above, which matches UE3's *half-volume* distance and could match its
+# silence point instead -- at the price of every sound being quieter close up
+# than UT3 plays it. That is the trade to revisit if this number has to move
+# again.
 #
 # `--sound-gain` scales relative to this, and the ceiling stays 255 so a value
 # above 1.0 still has somewhere to go.
 DEFAULT_VOLUME_GAIN = 1.0
-UT2_VOLUME_UNITY = 40
+UT2_VOLUME_UNITY = 13
 UT2_VOLUME_MAX = 255
 
 FFMPEG = "ffmpeg"
