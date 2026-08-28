@@ -925,6 +925,79 @@ def resolve_diffuse(pkg, index, ref, depth=12, reject=None, params=None):
     return None, None
 
 
+def all_material_textures(pkg, index, ref, depth=8):
+    """Every Texture2D a material refers to, drawn or not: [(package, export)].
+
+    `resolve_diffuse` answers "what is this surface painted with" and throws the
+    rest away, which is right for building a UE2 material and wrong for filling
+    a package a mapper is going to open afterwards. A UT3 material samples a
+    diffuse, a normal, a specular, a mask and often a cubemap; the conversion
+    picks one and the other four never reach UT2004 at all, so there is nothing
+    to hand-edit a FinalBlend into using.
+
+    Three places, because no one of them is complete. The instance chain's
+    `TextureParameterValues` hold what an instance swapped in, and are the only
+    record of it. `ReferencedTextures` is the cooker's own list of what the
+    compiled material uses, present on instances and materials alike. And the
+    base Material's own expressions catch what a texture sample names directly,
+    which `ReferencedTextures` does carry but only where the package was cooked.
+
+    Order is the order found, de-duplicated; liveness is deliberately not
+    considered, since a texture behind a dead static switch is exactly the kind
+    a mapper may want back.
+    """
+    found, seen = [], set()
+
+    def remember(owner, export):
+        if export is None:
+            return
+        key = (owner.path, export.index)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append((owner, export))
+
+    def texture_at(owner, value):
+        if value is None or value.is_null:
+            return
+        tex_owner, tex = index.resolve(owner, value)
+        if tex is not None and tex_owner.class_name_of(tex) == "Texture2D":
+            remember(tex_owner, tex)
+
+    owner_at, ref_at, left = pkg, ref, depth
+    while left > 0 and ref_at is not None and not ref_at.is_null:
+        owner_at, export_at = index.resolve(owner_at, ref_at)
+        if export_at is None:
+            break
+        props, start, _end = read_object_properties(owner_at, export_at)
+        if start is None:
+            break
+
+        overrides = props.get("TextureParameterValues")
+        if overrides is not None and len(overrides):
+            for entry in overrides.as_props():
+                texture_at(owner_at, entry.get("ParameterValue"))
+        referenced = props.get("ReferencedTextures")
+        if referenced is not None and len(referenced):
+            for value in referenced.as_objects():
+                texture_at(owner_at, value)
+
+        if owner_at.class_name_of(export_at) not in ("MaterialInstanceConstant",
+                                                     "MaterialInstanceTimeVarying"):
+            for candidate in owner_at.exports:
+                if candidate.outer != export_at.index:
+                    continue
+                tex_owner, tex = _texture_of(owner_at, index, candidate)
+                remember(tex_owner, tex) if tex is not None else None
+            break
+
+        parent = props.get("Parent")
+        if parent is None or parent.is_null:
+            break
+        ref_at, left = parent, left - 1
+    return found
+
+
 def material_uv_channel(pkg, index, ref, depth=12):
     """(uv_channel, u_tiling, v_tiling) for a material's diffuse texture.
 

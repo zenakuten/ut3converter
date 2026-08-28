@@ -117,7 +117,8 @@ class TextureSet:
 
     BASE_FALLBACK_NAME = "DefaultBSP"
 
-    def __init__(self, package_name, fallback=True, group="BSP", materials=True):
+    def __init__(self, package_name, fallback=True, group="BSP", materials=True,
+                 all_textures=False):
         self.package_name = package_name
         # Every texture this package defines carries it, so no two converted
         # maps can hand the ASE importer the same name -- see package_tag.
@@ -133,6 +134,14 @@ class TextureSet:
         # UnrealEd reports a poly with no material as a null material reference
         # on every build, so unresolved materials get a placeholder instead.
         self.fallback = fallback
+        # Ship every texture each material refers to, not only the one drawn.
+        # A UT3 material samples a diffuse, a normal, a specular, a mask and
+        # often a cubemap; the conversion picks one and the rest never reach
+        # UT2004, so a mapper opening the package has nothing to rebuild a
+        # material out of. See ut3.objects.material.all_material_textures.
+        self.all_textures = all_textures
+        # names registered only because of that, for reporting
+        self.extra = []
         self.by_material = {}   # (is_import, index) -> texture name
         self.textures = {}      # texture name -> (Package, export)
         self.unresolved = 0
@@ -268,6 +277,8 @@ class TextureSet:
         key = _material_key(ref)
         if key in self.by_material:
             return self.by_material[key]
+        if self.all_textures:
+            self._add_every_texture(pkg, index, ref)
         owner, tex_export, channel, tint = material_albedo(
             pkg, index, ref, reject=self._is_relief_bake)
         # A texture the material itself points at as its albedo channel is not
@@ -338,6 +349,25 @@ class TextureSet:
         if blend is not None:
             self.blend[name] = blend
         return name, False
+
+    def _add_every_texture(self, pkg, index, ref):
+        """Register everything this material refers to, drawn or not.
+
+        Plain copies: no albedo channel, no tint, no glow bake, so a texture
+        that is *also* drawn keeps its own dressed-up entry and this adds the
+        undressed one beside it only if the two differ. Nothing here is
+        referenced by a material, so the cost is package size and nothing else.
+        """
+        from ut3.objects.material import all_material_textures
+
+        try:
+            every = all_material_textures(pkg, index, ref)
+        except (ValueError, IndexError, KeyError, struct.error):
+            return
+        for owner, export in every:
+            name, existed = self.add_texture(owner, export)
+            if not existed:
+                self.extra.append(name)
 
     def _note_material(self, key, texture_name, pkg, index, ref):
         """Remember a surface UE2 can say more about than a Texture can.

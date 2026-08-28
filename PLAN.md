@@ -2447,6 +2447,41 @@ where no built map is to hand.
 `DekkTexV9` stays safe in the text contexts -- .uc `#exec` lines, T3D object
 references -- where a hyphen would need quoting.
 
+**Phase 31 -- `--all-textures`, for the four maps out of five that get thrown
+away.** Asked for: a UT3 material samples a diffuse, a normal, a specular, a
+mask and often a cubemap; the conversion picks the one the surface is painted
+with and the rest never reach UT2004 at all. A mapper opening the package to
+hand-build a FinalBlend has one texture of five and nothing to work with.
+
+`ut3.objects.material.all_material_textures` collects them from three places,
+because no one of them is complete:
+
+* the instance chain's `TextureParameterValues`, the only record of what an
+  instance swapped in;
+* `ReferencedTextures`, the cooker's own list of what the compiled material
+  uses, on instances and materials alike;
+* and the base Material's own texture expressions, which catches what a sample
+  names directly and does not depend on the package having been cooked.
+
+Liveness is deliberately *not* considered. `resolve_diffuse` cares which branch
+a static switch takes because it has to pick one texture; this does not, and a
+texture behind a dead branch is exactly the kind worth having back.
+
+The extras are registered as plain copies -- no albedo channel, no tint, no glow
+bake -- so a texture that is also drawn keeps its dressed-up entry and gains an
+undressed one beside it only where the two differ. Nothing references them.
+
+*What it costs, on BL-Dekk:*
+
+    textures written        71  ->  189      (169 of them only for this)
+    exported .dds           113MB -> 257MB
+    built .utx              160MB -> 310MB
+
+UCC builds the 310MB package without complaint and UT2004 loads it -- checked
+with `ucc dumpint`, since a package that size is exactly where the engine might
+have had a limit. Whether it is *worth* 150MB is the mapper's call, which is why
+it is a flag and not the default.
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes

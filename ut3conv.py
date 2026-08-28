@@ -194,7 +194,8 @@ def clean_package(out_dir, package):
 def _build_assets(p, package_path, texture_package, out_dir, max_size, with_meshes, scale,
                   skip_effects, with_terrain, layer_scale, no_skybox, with_sounds=True,
                   sound_gain=1.0, with_movers=True, max_keys=24, no_collision=(),
-                  deco_density=None, with_materials=True, with_sublevels=True):
+                  deco_density=None, with_materials=True, with_sublevels=True,
+                  all_textures=False):
     """Extract textures (and optionally static meshes) into one buildable package."""
     from convert.textures import TextureSet, collect_brush_materials, export_textures
     from ut3.resolve import PackageIndex
@@ -223,7 +224,8 @@ def _build_assets(p, package_path, texture_package, out_dir, max_size, with_mesh
             print("  %d streaming sub-level(s) NOT FOUND, so their part of the "
                   "map is missing: %s" % (len(missing), ", ".join(missing)))
 
-    texture_set = TextureSet(texture_package, materials=with_materials)
+    texture_set = TextureSet(texture_package, materials=with_materials,
+                             all_textures=all_textures)
     for level in levels:
         collect_brush_materials(level, index, texture_set)
 
@@ -369,10 +371,14 @@ def cmd_t3d(args):
             sound_gain=args.sound_gain, with_movers=not args.no_movers,
             max_keys=args.mover_keys, with_materials=not args.no_materials,
             with_sublevels=not args.no_sublevels,
+            all_textures=args.all_textures,
         )
         print("  package: %s" % os.path.dirname(os.path.dirname(uc_path)))
         print("  textures: %d written, %d materials unresolved -> %s"
               % (written, texture_set.unresolved, os.path.basename(uc_path)))
+        if texture_set.extra:
+            print("      %d imported only because --all-textures asked for them, "
+                  "referenced by nothing" % len(texture_set.extra))
         if texture_set.composited:
             print("      %d had a separate UE3 opacity mask baked into their alpha"
                   % len(texture_set.composited))
@@ -1094,6 +1100,12 @@ def build_parser():
     sp.add_argument("--keep-effect-meshes", action="store_true",
                     help="convert unlit translucent effect meshes (light beams, fog sheets) "
                          "instead of skipping them; they import as opaque surfaces")
+    sp.add_argument("--all-textures", action="store_true",
+                    help="import every texture each material refers to, not just "
+                         "the one drawn -- normals, speculars, masks and the "
+                         "branches a static switch turns off. Nothing references "
+                         "them; they are there for hand-editing the package "
+                         "afterwards, and they cost package size")
     sp.add_argument("--no-materials", action="store_true",
                     help="do not build UE2 Shader/FinalBlend objects for translucent, "
                          "additive or unlit surfaces; every surface falls back to a "

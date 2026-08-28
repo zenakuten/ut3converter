@@ -29,7 +29,7 @@ OUTPUT = os.path.join(os.path.dirname(HERE), "src", "spec_generated.h")
 SECTIONS = [
     ("Package and scale", ["texture_package", "textures", "max_texture_size",
                            "scale", "surface_scale", "no_package",
-                           "no_materials"]),
+                           "no_materials", "all_textures"]),
     ("Leave out", ["no_meshes", "no_terrain", "no_movers", "no_sounds",
                    "no_lights", "no_pickups", "no_paths", "no_player_starts",
                    "no_objectives", "no_teleporters", "no_teleporter_effect",

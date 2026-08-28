@@ -243,6 +243,24 @@ def main(content):
             check("a liquid keeps the texture its colour path resolves",
                   tex.name if tex else None, "SF_T_TilingBubbles_M")
 
+        # --all-textures ships everything a material refers to, not just what
+        # the conversion draws. A UT3 material samples a diffuse, a normal, a
+        # specular, a mask and often a cubemap; without this a mapper opening
+        # the package has one of the five and nothing to rebuild a material out
+        # of. Liveness is deliberately not considered -- a texture behind a dead
+        # static switch is exactly the kind worth having back.
+        from ut3.objects.material import all_material_textures
+
+        if pipe is not None:
+            every = [t.name for _o, t in all_material_textures(dekk, index, pipe)]
+            check_that("a liquid refers to far more than it draws",
+                       len(every) > 5, "%d textures" % len(every))
+            check_that("including the one it is painted with",
+                       "SF_T_TilingBubbles_M" in every)
+            check_that("and the normal map the diffuse walk refuses",
+                       "SF_T_TilingBubbles_N_H" in every, str(every[:4]))
+            check("with no duplicates", len(every), len(set(every)))
+
         # Matinee names an instance per animated parameter, so the leaf says
         # nothing; the identity is up the chain.
         pool = by_name.get("MaterialInstanceConstant_835")
