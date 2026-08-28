@@ -29,6 +29,9 @@ struct Opt {
     const char* def;         // the default, as text ("true"/"false" for Flag)
     const char* help;        // argparse help, shown on hover
     bool required;
+    // A positional taking nargs="*" or "+": one field, split on whitespace, so
+    // repoint_package.py can be given a .ut2 and its .utx in one box.
+    bool variadic;
     Browse browse;
     const char* choices[8];  // Choice only, null-terminated by zero-init
 };

@@ -191,6 +191,8 @@ bool App::Init(SDL_Window* window) {
     SetupPanel(convert_, "Convert", "t3d", "ut3conv.py",
                spec::kT3dOptions, spec::kT3dOptionCount,
                spec::kT3dSections, spec::kT3dSectionCount);
+    SetupPanel(repoint_, "Repoint", "", "tools/repoint_package.py",
+               spec::kRepointOptions, spec::kRepointOptionCount);
     SetupPanel(batch_, "Batch", "", "batch.py",
                spec::kBatchOptions, spec::kBatchOptionCount);
 
@@ -221,7 +223,23 @@ std::vector<std::string> App::Argv(const Panel& panel) const {
     for (const Value& value : panel.values) {
         if (value.opt->flag[0] != '\0') continue;
         std::string text = value.Text();
-        if (!text.empty()) argv.push_back(text);
+        if (text.empty()) continue;
+        if (!value.opt->variadic) {
+            argv.push_back(text);
+            continue;
+        }
+        // nargs="*": one field holding several paths. repoint_package.py wants
+        // a map and its package together, and a single argv entry with a space
+        // in it would be read as one filename.
+        size_t at = 0;
+        while (at < text.size()) {
+            size_t start = text.find_first_not_of(" \t", at);
+            if (start == std::string::npos) break;
+            size_t stop = text.find_first_of(" \t", start);
+            if (stop == std::string::npos) stop = text.size();
+            argv.push_back(text.substr(start, stop - start));
+            at = stop;
+        }
     }
     for (const Value& value : panel.values) {
         if (value.opt->flag[0] == '\0') continue;
@@ -686,6 +704,20 @@ void App::Frame() {
                 ImGui::EndCombo();
             }
             DrawPanel(*inspect_[inspect_index_]);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Repoint")) {
+            ImGui::TextDisabled(
+                "Rename the texture package a built map refers to, for shipping "
+                "an edited copy under a name of your own.");
+            ImGui::TextDisabled(
+                "Both files: the map imports a class of that name as well as "
+                "the package, so renaming only the .ut2 leaves it unloadable. "
+                "The new name must be exactly as long as the old one.");
+            ImGui::TextDisabled(
+                "Put the .ut2 and the .utx in files, separated by a space. "
+                "Use list on its own first to see what a map imports.");
+            DrawPanel(repoint_);
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();

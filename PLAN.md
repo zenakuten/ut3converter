@@ -2482,6 +2482,33 @@ with `ucc dumpint`, since a package that size is exactly where the engine might
 have had a limit. Whether it is *worth* 150MB is the mapper's call, which is why
 it is a flag and not the default.
 
+**Phase 32 -- the GUI catches up, and gains a fourth tab.** Two things: the
+generated spec had drifted, and `repoint_package.py` had no interface at all.
+
+*The drift was free to fix, which is the point of the generator.* Re-running
+`tools/gen_spec.py` picked up `--all-textures`, the `--max-texture-size` default
+moving to 4096, `batch.py --flag`, and `--no-sublevels`, which had been missing
+from the header since Phase 18 and was quietly landing in "Other". Nothing about
+those flags is stated twice: the widget, default, tooltip and choices all come
+out of argparse, which is why fifty-odd options stay honest. `--all-textures`
+was put in "Package and scale" beside the texture cap it interacts with.
+
+*The Repoint tab needed one thing the spec could not express.* Its `files`
+argument is `nargs="*"` -- a map and its package together -- and the interface
+gives every option one field, so the single argv entry `"DM-Dekk.ut2
+DekkTexV9.utx"` would reach argparse as one filename. `Opt` gains a `variadic`
+bool, set from `action.nargs in ("*", "+")`, and `Argv` splits that one field on
+whitespace. That is the whole special case, and it is general rather than
+specific to this tool.
+
+The tab says the two things the tool refuses for, since a mapper meeting it for
+the first time will hit both: the new name must be exactly as long as the old,
+and both files have to be given because the map imports a class of that name as
+well as the package.
+
+Built for Linux and Windows -- the mingw cross-build is still good -- and the
+Linux binary launches.
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes

@@ -224,17 +224,25 @@ def verify(original, rewritten, old, new):
         os.unlink(name)
 
 
-def main():
+def build_parser():
+    """The command line, split out so gui/tools/gen_spec.py can read it back."""
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("old", nargs="?", help="the package name in use now")
     parser.add_argument("new", nargs="?",
-                        help="what to call it, same length as the old one")
+                        help="what to call it, exactly as long as the old one")
     parser.add_argument("files", nargs="*",
-                        help="every file that names it -- the .ut2 and its .utx")
+                        help="every file that names it -- both the .ut2 and its "
+                             ".utx, since the map imports a class of that name "
+                             "as well as the package")
     parser.add_argument("--list", metavar="FILE",
-                        help="show the packages FILE imports and stop")
+                        help="show the packages FILE imports, and stop")
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.list:

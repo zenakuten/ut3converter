@@ -30,6 +30,14 @@ at the top of `batch.py`.
 **Inspect** is `info`, `classes`, `list`, `props` and `imports` — reading a UT3
 package without converting it, which is how most conversion bugs get found.
 
+**Repoint** is `tools/repoint_package.py` — renaming the texture package a built
+map refers to, for a mapper shipping an edited copy under a name of their own.
+Two things it will tell you off for, both learnt the hard way: the new name has
+to be *exactly as long* as the old one, and both files have to be given, since
+the map imports a class of that name as well as the package. Put the `.ut2` and
+the `.utx` in the one `files` box separated by a space; `list` on its own shows
+what a map imports today.
+
 Only options you actually changed reach the command line, so the previewed
 command stays as short as the one you would have typed.
 

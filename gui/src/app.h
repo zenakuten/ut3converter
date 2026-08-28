@@ -1,4 +1,4 @@
-// The interface: three tabs over ut3conv.py and batch.py.
+// The interface: four tabs over ut3conv.py, batch.py and repoint_package.py.
 #pragma once
 
 #include <SDL3/SDL.h>
@@ -71,6 +71,7 @@ private:
 
     Panel convert_;
     Panel batch_;
+    Panel repoint_;
     // Held by pointer: the output reader thread captures a Runner*, so a
     // Panel must keep its address for as long as it lives.
     std::vector<std::unique_ptr<Panel>> inspect_;
