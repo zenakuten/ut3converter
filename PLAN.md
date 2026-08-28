@@ -2509,6 +2509,31 @@ well as the package.
 Built for Linux and Windows -- the mingw cross-build is still good -- and the
 Linux binary launches.
 
+**Phase 33 -- `tools/make_release.py`, so the zips stop being hand-made.** The
+v1 and v2 archives were assembled by hand, and both mistakes that came of it are
+now things the script cannot make.
+
+`__pycache__` is excluded at *copy* time rather than cleaned beforehand. The
+first v2 Linux zip shipped 50 `.pyc` files, because the smoke test proving the
+scripts still imported regenerated them after the clean; it was caught only by
+diffing the file list against v1. Extracting the v3 zip and running everything in
+it reproduces the same `__pycache__` folders in the extracted tree -- and the zip
+still has none.
+
+And `tools/` ships now. The GUI's Repoint tab runs `tools/repoint_package.py`
+and looks for it under the folder Setup points at, so a release without it offers
+a tab that cannot work. The script refuses to write an archive missing it, along
+with one carrying bytecode.
+
+    ut3convgui-linux-v3.zip     56 files, 0.8 MB
+    ut3convgui-windows-v3.zip   60 files, 3.1 MB
+
+Against v2 that adds `tools/` entire and `convert/collections.py` and
+`convert/sublevels.py`, which postdated it. The Windows archive still carries
+four DLLs: SDL3 and libssp from the cross-build, and lzo2 and lz4 because
+Windows looks for a ctypes library beside python.exe rather than beside the
+script -- the "Could not find module liblzo2.so.2" a user hit on the v1 release.
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes
