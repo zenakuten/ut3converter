@@ -149,13 +149,13 @@ def _anim_sets(pkg):
         if pkg.class_name_of(export) != "AnimSet":
             continue
         try:
-            bones, sequences, mesh_name = read_anim_set(pkg, export)
+            anim_set = read_anim_set(pkg, export)
         except AnimError:
             continue
-        if not mesh_name:
+        if not anim_set.mesh_name:
             continue
-        found.setdefault(str(mesh_name).rsplit(".", 1)[-1], []).append(
-            (export.name, bones, sequences))
+        found.setdefault(str(anim_set.mesh_name).rsplit(".", 1)[-1], []).append(
+            (export.name, anim_set))
     return found
 
 
@@ -173,14 +173,17 @@ def _build_sequences(pkg, anim_sets, mesh, stats):
     rest = [(b.position, b.orientation) for b in mesh.bones]
 
     out = []
-    for set_name, track_bones, refs in anim_sets:
-        # Track index -> bone number in the mesh's own skeleton.
+    for set_name, anim_set in anim_sets:
+        # Track index -> bone number in the mesh's own skeleton, and whether
+        # that bone's translation comes from the animation at all.
         track_of_bone = {}
-        for track, bone in enumerate(track_bones):
+        animated_translation = {}
+        for track, bone in enumerate(anim_set.bones):
             number = bone_number.get(str(bone).lower())
             if number is not None:
                 track_of_bone[number] = track
-        for ref in refs:
+                animated_translation[number] = anim_set.uses_translation(bone)
+        for ref in anim_set.sequences:
             if not 0 < ref <= len(pkg.exports):
                 continue
             export = pkg.exports[ref - 1]
@@ -196,6 +199,13 @@ def _build_sequences(pkg, anim_sets, mesh, stats):
                     position, rotation = (None, None)
                     if track is not None:
                         position, rotation = sequence.sample(track, frame)
+                        # bAnimRotationOnly: the bone rotates, but its offset
+                        # from its parent is the mesh's, not the animation's.
+                        # Taking the animation's instead moves the DarkWalker's
+                        # leg bones up to 389uu off their bind position, and
+                        # the skin follows -- which is what made the legs bulge.
+                        if not animated_translation.get(number, True):
+                            position = None
                     if position is None:
                         position = rest[number][0]
                     if rotation is None:

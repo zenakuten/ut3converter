@@ -150,17 +150,51 @@ def read_anim_sequence(pkg, export):
                     tracks)
 
 
+def _fname_list(pkg, array):
+    """An FName array is eight bytes an entry -- a name index and a number."""
+    out = []
+    if array is None:
+        return out
+    for i in range(array.count):
+        index, _number = struct.unpack_from("<2i", array.raw, i * 8)
+        out.append(pkg.names[index] if 0 <= index < len(pkg.names) else "")
+    return out
+
+
+class AnimSet:
+    """An AnimSet's tracks and the sequences that play on them."""
+
+    def __init__(self, bones, sequences, mesh_name, rotation_only,
+                 translated_bones):
+        self.bones = bones
+        self.sequences = sequences
+        self.mesh_name = mesh_name
+        # UAnimSet.bAnimRotationOnly defaults to TRUE, and a UT3 package only
+        # writes the property when it is FALSE -- so an absent property means
+        # rotation-only, not the other way round. The DarkWalker has one of
+        # each: the torso sets it False and animates its turret's translation,
+        # the legs leave it out and must take translation from the bind pose.
+        self.rotation_only = rotation_only
+        # The exceptions bAnimRotationOnly allows: these bones keep the
+        # animation's own translation.
+        self.translated_bones = set(n.lower() for n in translated_bones)
+
+    def uses_translation(self, bone_name):
+        if not self.rotation_only:
+            return True
+        return str(bone_name).lower() in self.translated_bones
+
+
 def read_anim_set(pkg, export):
-    """Parse one AnimSet. Returns (track bone names, sequence refs, mesh name)."""
+    """Parse one AnimSet."""
     props, _start, _end = read_object_properties(pkg, export)
     names = props.get("TrackBoneNames")
     sequences = props.get("Sequences")
     if names is None or sequences is None:
         raise AnimError("AnimSet has no tracks or no sequences")
-    # An FName array is eight bytes an entry -- a name-table index and an
-    # instance number -- so as_ints() would read the numbers as names.
-    bones = []
-    for i in range(names.count):
-        index, _number = struct.unpack_from("<2i", names.raw, i * 8)
-        bones.append(pkg.names[index] if 0 <= index < len(pkg.names) else "")
-    return bones, sequences.as_ints(), props.get("PreviewSkelMeshName")
+    rotation_only = props.get("bAnimRotationOnly")
+    if rotation_only is None:
+        rotation_only = True
+    return AnimSet(_fname_list(pkg, names), sequences.as_ints(),
+                   props.get("PreviewSkelMeshName"), bool(rotation_only),
+                   _fname_list(pkg, props.get("UseTranslationBoneNames")))
