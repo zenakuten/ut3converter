@@ -2534,6 +2534,90 @@ four DLLs: SDL3 and libssp from the cross-build, and lzo2 and lz4 because
 Windows looks for a ctypes library beside python.exe rather than beside the
 script -- the "Could not find module liblzo2.so.2" a user hit on the v1 release.
 
+**Phase 34 -- extracting a content package, skeletal meshes and animations
+included.** Asked for: pull the DarkWalker out of `VH_DarkWalker.upk` and build
+it into a `.utx`. "I can totally make all the script, texture and particle
+systems manually if needed, but I need a skeletalmesh."
+
+`ut3conv assets <pkg.upk>` sweeps a package's export table instead of a level's
+actors. The three exporters already took any `(Package, export)` pair -- what
+was missing is that every caller reached them by walking a level, and a content
+package has no level, so nothing referenced anything and they found nothing.
+
+While in there: `ut3conv textures` was dead. It called `_build_texture_set`,
+renamed to `_build_assets` some releases back, and raised `NameError` on every
+invocation. It is now the textures-only case of the same sweep. `--all-textures`
+crashed the same way it always would have on a texture in a format `to_bgra`
+cannot decode -- the `path is None` guard sat *below* the code using `options`,
+so it was unreachable. Nothing a material draws goes down that path, which is
+why 157 maps never hit it; BL-Dekk has two PF_V8U8 sky masks that nothing
+references.
+
+`USkeletalMesh` is native and undocumented, so `ut3/objects/skeletalmesh.py` was
+derived from UT3's packages and checked against the bounding box each mesh
+declares. Two things it gets wrong if assumed: the index buffer is written
+**twice**, byte-identical, and the vertex stride depends on a `NumTexCoords`
+declared *later* in the stream than the vertices needing it -- so the stride is
+probed by requiring every position to land inside the declared bounds. UT3's own
+editor confirmed the reader exactly: `Bones:40 Polys:2132 Verts:1683 (Rigid:246
+Soft:1437) Chunks:2 Sections:2`, every number matching.
+
+Positions are merged across UV seams rather than written one point per corner.
+UT2004 derives vertex normals from the faces meeting at a *point*, so unmerged
+points make every edge hard; the torso merges 2,337 of 5,136.
+
+Three format facts, none inferable from the code, each of which produced a
+plausible-looking wrong result:
+
+* **UE2 stores quaternions conjugated relative to UE3.** `FQuatToFCoordsFast`
+  (UnMath.h:4540) builds `XAxis.Y = xy - wz` where UE3's
+  `FQuatRotationTranslationMatrix` has `xy + wz`. Passing the quaternion across
+  unchanged inverts every rotation; up a leg's bone chain that renders as a
+  splayed cage. The file carries `(X, -Y, Z, +W)` so that what lands in UE2
+  after the importer's own `(X, -Y, Z, -W)` is `conj(q)`. Applied to the
+  reference skeleton *and* the keys -- skinning is `RefBases^-1 * SpaceBases`,
+  so correcting one side alone breaks the rest pose.
+* **UE3's NoW rotation formats rebuild W with the negative root.** The positive
+  root yields `(x, y, z, -w)`, the conjugate. Bones with a small `|W|` barely
+  move, so some legs looked fine and others pointed skyward. UT3's data says it
+  outright: `ActiveStill` is an idle pose, and `Leg2_Shoulder` read bind
+  `(-.238, -.412, .440, -.761)` against a decoded `(-.239, -.414, .439, +.761)`.
+* **`USERAWINFO` is mandatory on `#exec ANIM DIGEST`.** Without it DIGEST calls
+  `RawAnimSeqInfo.Empty()` (UnEdSrv.cpp:1038) and discards the ANIMINFO chunk
+  naming the sequences. The build reports `Success - 0 error(s), 0 warning(s)`,
+  creates the animation object, and it holds nothing.
+
+A track with exactly one key is stored raw whatever format it declares --
+`ActiveStill` declares `ACF_IntervalFixed32NoW` across 40 single-key tracks and
+its stream is exactly 40 x (12 + 12) bytes -- and `ACF_Float96NoW` keeps raw
+floats for *every* key, not only single ones. Both were settled by requiring the
+track offsets to consume the stream exactly, which all nine of the DarkWalker's
+sequences do, none short and none over.
+
+*The lesson from the debugging*, which cost four rounds in the editor: a check
+that compares two of your own computations of the same data validates the
+transform between them and nothing else. Bone world positions and orientations
+agreed to 0.000 between the UE3 and UE2 paths while both were fed the same badly
+decoded W. What exposed it was comparing the decoded pose against something
+independent -- an idle animation should sit on the bind pose -- and that test
+found it in one step. The same applies to the conjugation: a bind pose cannot
+reveal a rotation-convention error, because at rest `RefBases^-1 * SpaceBases`
+cancels whatever the convention.
+
+*Verified on `VH_DarkWalker.upk`*: 7 textures, 7 static meshes, 2 skeletal
+meshes, 74 bones, 3,945 points, 7,448 faces and 9 animations over 5,468 keys,
+building through `ucc make` with no warnings into a 9.8MB `.utx`, and confirmed
+in the UT2004 animation browser against the same sequences in the UT3 editor.
+Sounds come from the separate `A_Vehicle_DarkWalker.upk`, 16 of 16 decoding.
+
+**Not converted**, and reported by name rather than dropped silently:
+`ParticleSystem`, `PhysicsAsset`, `AnimTree`, and the `UTSkelControl` chain --
+UE2 has no equivalent for any of them. So a `.utx` of the DarkWalker's parts is
+not a DarkWalker: the vehicle is UnrealScript plus an AnimTree, and neither
+converts. Only this one package has been through it; a mesh with more than one
+UV set, or a rotation format other than `Float96NoW` and `IntervalFixed32NoW`,
+reaches code no data has yet exercised.
+
 ### Running the UDK editor under Wine
 
 Not needed to convert anything -- the pipeline is pure Python and never invokes
@@ -3115,8 +3199,15 @@ per-map polish found by looking — and Phase 14's generated materials, which
 build and resolve correctly but have not been walked through in the editor.
 
 **Not planned:** particles and emitters, Kismet, SpeedTree, PostProcessVolume,
-skeletal meshes, destructibles. (UE3 shader materials were on this list until
-Phase 14 showed they can be built.)
+destructibles. (UE3 shader materials were on this list until Phase 14 showed
+they can be built, and skeletal meshes until Phase 34 did.)
+
+**Content packages, not just maps.** `ut3conv assets <pkg.upk>` extracts a
+`.upk`'s textures, static meshes, sounds, skeletal meshes and animations into
+one buildable package -- see Phase 34. Only `VH_DarkWalker.upk` has been through
+it end to end; the other vehicles sit beside it and should take the same path,
+but a mesh with more than one UV set, or a rotation format other than
+`Float96NoW` and `IntervalFixed32NoW`, reaches untested code.
 
 **Wanted, not done:** TOXIKK's CC maps convert as `DM-` because Cell Capture's
 objectives do not convert. Assault is the mode that matches and the mod is
