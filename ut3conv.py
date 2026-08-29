@@ -975,19 +975,126 @@ def cmd_t3d(args):
         print("  %d polygons had UE3-only flag bits dropped" % stats.dropped_flag_bits)
 
 
-def cmd_textures(args):
+# What `assets` sweeps out of a content package, and which exporter takes it.
+# Everything else in a .upk -- SkeletalMesh, AnimSet, ParticleSystem,
+# PhysicsAsset, AnimTree -- has no UE2 equivalent this converter can write, so
+# it is counted and reported rather than silently ignored.
+ASSET_CLASSES = ("Texture2D", "StaticMesh", "SoundNodeWave")
+
+# Named so the summary can say what it is leaving behind rather than just how
+# many exports it skipped. The count is what matters: a .upk whose content is
+# mostly skeletal is not worth extracting.
+UNCONVERTIBLE = ("SkeletalMesh", "AnimSet", "AnimSequence", "ParticleSystem",
+                 "PhysicsAsset", "AnimTree")
+
+
+def _build_package_assets(p, package_path, package_name, out_dir, max_size,
+                          match=None, with_textures=True, with_meshes=True,
+                          with_sounds=True, scale=1.0):
+    """Extract a content package's assets, with no level to walk.
+
+    `_build_assets` above starts from a level and follows its actors, which is
+    the only way to know what a *map* uses. A .upk has no level: nothing
+    references anything, so the sweep is the package's own export table and
+    every asset of a class we can write is taken.
+    """
+    from convert.meshes import MeshSet, export_meshes
+    from convert.sounds import SoundSet, export_sounds
+    from convert.textures import TextureSet, export_textures
+    from ut3.resolve import PackageIndex
+
+    stale = clean_package(out_dir, package_name)
+    if stale:
+        print("  cleared %d file(s) from the previous build" % stale)
+
+    index = PackageIndex.for_map(package_path)
+    texture_set = TextureSet(package_name)
+    counts = {cls: 0 for cls in ASSET_CLASSES}
+    left = {}
+
+    mesh_set = MeshSet(package_name)
+    sound_set = SoundSet(package_name)
+    for e in p.exports:
+        cls = p.class_name_of(e)
+        if cls in UNCONVERTIBLE:
+            left[cls] = left.get(cls, 0) + 1
+            continue
+        if cls not in ASSET_CLASSES:
+            continue
+        if match and not fnmatch.fnmatch(e.name.lower(), match.lower()):
+            continue
+        if cls == "Texture2D" and with_textures:
+            texture_set.add_texture(p, e)
+        elif cls == "StaticMesh" and with_meshes:
+            mesh_set.meshes[mesh_set._unique(e.name)] = (p, e, (), None)
+        elif cls == "SoundNodeWave" and with_sounds:
+            sound_set.waves[sound_set._unique(e.name)] = (p, e)
+        else:
+            continue
+        counts[cls] += 1
+
+    # Meshes before textures, for the reason _build_assets gives: exporting a
+    # mesh is where its materials are read, and those add to the texture set.
+    extra_exec, mesh_stats = [], None
+    if with_meshes and mesh_set.meshes:
+        extra_exec, mesh_stats = export_meshes(
+            mesh_set, out_dir, index, texture_set, scale=scale
+        )
+        extra_exec = list(extra_exec)
+    sound_stats = None
+    if with_sounds and sound_set.waves:
+        sound_exec, sound_stats = export_sounds(sound_set, out_dir, index)
+        extra_exec += list(sound_exec)
+
+    written, uc_path = export_textures(
+        texture_set, out_dir, index, max_size=max_size, extra_exec=extra_exec
+    )
+    if with_meshes and mesh_set.meshes:
+        from convert.meshes import apply_skins
+
+        # No actors to skin, but this is also what settles mesh_set.skins, so
+        # the summary can say how many elements found a material.
+        apply_skins([], mesh_set, texture_set, mesh_stats)
+    return (texture_set, written, uc_path, counts, left, mesh_set, sound_set,
+            mesh_stats, sound_stats)
+
+
+def cmd_assets(args):
     p = Package(args.package)
-    texture_package = _texture_package_name(args.package, args.texture_package)
-    texture_set, written, uc_path = _build_texture_set(
-        p, args.package, texture_package, args.output, args.max_texture_size
+    package_name = _texture_package_name(args.package, args.texture_package)
+    (texture_set, written, uc_path, counts, left, mesh_set, sound_set,
+     mesh_stats, sound_stats) = _build_package_assets(
+        p, args.package, package_name, args.output, args.max_texture_size,
+        match=args.match, with_textures=not args.no_textures,
+        with_meshes=not args.no_meshes, with_sounds=not args.no_sounds,
+        scale=args.scale,
     )
     print("%s -> %s" % (os.path.basename(args.package), args.output))
-    print("  %d materials referenced by BSP, %d resolved to a texture, %d unresolved"
-          % (len(texture_set.by_material), len(texture_set.textures), texture_set.unresolved))
-    print("  %d texture files written" % written)
-    print("  package source: %s" % uc_path)
+    print("  package: %s" % os.path.join(args.output, package_name))
+    print("  %d texture(s), %d static mesh(es), %d sound(s)"
+          % (counts["Texture2D"], counts["StaticMesh"], counts["SoundNodeWave"]))
+    print("  %d texture file(s) written -> %s"
+          % (written, os.path.basename(uc_path)))
+    if sound_stats is not None and getattr(sound_stats, "failed", None):
+        print("  %d sound(s) could not be decoded: %s"
+              % (len(sound_stats.failed),
+                 ", ".join(name for name, _why in sound_stats.failed[:5])))
     for name, why in texture_set.failed[:10]:
         print("  skipped %s: %s" % (name, why))
+    if left:
+        print("  not converted, no UE2 equivalent: %s"
+              % ", ".join("%d %s" % (n, cls) for cls, n in sorted(left.items())))
+    print("  build it with: ucc make   (add %s to EditPackages)" % package_name)
+
+
+def cmd_textures(args):
+    """Textures only -- `assets` with the other two sweeps off."""
+    args.no_meshes = True
+    args.no_sounds = True
+    args.no_textures = False
+    args.match = None
+    args.scale = 1.0
+    return cmd_assets(args)
 
 
 def cmd_imports(args):
@@ -1185,6 +1292,24 @@ def build_parser():
     sp.add_argument("--texture-package", help="name for the generated package")
     sp.add_argument("--max-texture-size", type=int, default=DEFAULT_MAX_SIZE)
     sp.set_defaults(func=cmd_textures)
+
+    sp = sub.add_parser("assets", help="extract a content package's textures, "
+                                       "static meshes and sounds into one "
+                                       "buildable UT2004 package")
+    sp.add_argument("package")
+    sp.add_argument("-o", "--output", default=install_root(),
+                    help="where to write the package (default: the UT2004 install root)")
+    sp.add_argument("--texture-package", help="name for the generated package")
+    sp.add_argument("--max-texture-size", type=int, default=DEFAULT_MAX_SIZE,
+                    help="largest mip to export (default %d)" % DEFAULT_MAX_SIZE)
+    sp.add_argument("-m", "--match",
+                    help="only assets whose name matches this glob")
+    sp.add_argument("--scale", type=float, default=1.0,
+                    help="scale applied to static mesh geometry (default 1.0)")
+    sp.add_argument("--no-textures", action="store_true", help="skip Texture2D")
+    sp.add_argument("--no-meshes", action="store_true", help="skip StaticMesh")
+    sp.add_argument("--no-sounds", action="store_true", help="skip SoundNodeWave")
+    sp.set_defaults(func=cmd_assets)
 
     sp = sub.add_parser("imports", help="list imports")
     sp.add_argument("package")

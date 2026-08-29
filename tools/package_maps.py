@@ -46,9 +46,11 @@ def compress(system, folder, filename):
     """Run UCC's compress commandlet, which writes <file>.uz2 beside the source.
 
     The path has to be given with backslashes: the commandlet does its own
-    parsing and a forward slash makes it fail to find the file.
+    parsing and a forward slash makes it fail to find the file. That applies
+    inside `folder` too, so a nested output folder (UT3Maps/Redirect) is
+    translated rather than passed through.
     """
-    windows_path = "..\\%s\\%s" % (folder, filename)
+    windows_path = "..\\%s\\%s" % (folder.replace("/", "\\"), filename)
     result = subprocess.run(["./UCC.exe", "compress", windows_path],
                             cwd=system, capture_output=True, text=True)
     return result.returncode == 0
