@@ -19,6 +19,24 @@ UE3 data is already in Unreal space, so writing it unchanged would import
 mirrored and inside out. Applying the same flip here makes the importer's flip
 cancel it -- the file on disk is in Max space, which is what a .psk is
 supposed to be.
+
+**UE2 stores quaternions conjugated relative to UE3.** FQuatToFCoordsFast
+(UnMath.h:4540, and FastQuatToFCoords at :3546 identically) builds
+
+    XAxis.Y = xy - wz        YAxis.X = xy + wz
+
+where UE3's FQuatRotationTranslationMatrix -- and every other engine's
+row-vector form -- has those two the other way round. So a UE2 FCoords built
+from q is the rotation UE3 would build from conj(q), and every rotation comes
+out inverted if the quaternion is passed across as-is. Composed up a chain of
+leg bones that renders as a splayed cage rather than a tucked leg.
+
+Both this and the Y-mirror are folded into what gets written: to land conj(q)
+in UE2 after the importer's (X, -Y, Z, -W), the file carries (X, -Y, Z, +W) --
+W is the one component the importer's negation must *not* be undone for. The
+reference skeleton and the animation keys all go through it, which matters:
+skinning is RefBases^-1 * SpaceBases, so a convention applied to only one of
+the two would leave the rest pose wrong.
 """
 
 import struct
@@ -82,7 +100,7 @@ def write_psk(path, points, wedges, faces, materials, bones, influences):
             payload += _name(name)
             payload += struct.pack("<Iii", flags, 0, parent)
             # VJointPos: FQuat, FVector, Length, XSize, YSize, ZSize.
-            payload += struct.pack("<4f", qx, -qy, qz, -qw)
+            payload += struct.pack("<4f", qx, -qy, qz, qw)
             payload += struct.pack("<3f", pos[0], -pos[1], pos[2])
             payload += struct.pack("<4f", 0.0, 0.0, 0.0, 0.0)
         _chunk(handle, "REFSKELT", 120, len(bones), bytes(payload))
@@ -122,7 +140,7 @@ def write_psa(path, bones, sequences):
             qx, qy, qz, qw = quat
             payload += _name(name)
             payload += struct.pack("<Iii", flags, 0, parent)
-            payload += struct.pack("<4f", qx, -qy, qz, -qw)
+            payload += struct.pack("<4f", qx, -qy, qz, qw)
             payload += struct.pack("<3f", pos[0], -pos[1], pos[2])
             payload += struct.pack("<4f", 0.0, 0.0, 0.0, 0.0)
         _chunk(handle, "BONENAMES", 120, len(bones), bytes(payload))
@@ -154,7 +172,7 @@ def write_psa(path, bones, sequences):
             for position, quat in keys:
                 qx, qy, qz, qw = quat
                 payload += struct.pack("<3f", position[0], -position[1], position[2])
-                payload += struct.pack("<4f", qx, -qy, qz, -qw)
+                payload += struct.pack("<4f", qx, -qy, qz, qw)
                 payload += struct.pack("<f", step)
                 count += 1
         _chunk(handle, "ANIMKEYS", 32, count, bytes(payload))
