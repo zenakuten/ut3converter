@@ -193,6 +193,17 @@ def _build_sequences(pkg, anim_sets, mesh, stats):
                 stats.failed.append((export.name, str(exc)))
                 continue
             keys = []
+            # Quaternion hemisphere, seeded from the bind pose. q and -q are
+            # the same rotation and every matrix check passes either way, but
+            # UT2004 seeds CachedOrientations from the reference skeleton
+            # (UnSkeletalMesh.cpp:4233) and blends towards the animation --
+            # and a slerp between opposite hemispheres goes the long way
+            # round. UT3's compressed rotations always rebuild W >= 0 (the
+            # NoW formats drop W and take the positive root), while 39 of the
+            # DarkWalker's 40 leg bones have W < 0 at bind, so 3,939 of its
+            # 4,040 leg keys arrived opposed. That is what laid the legs flat
+            # instead of hanging them down.
+            hemisphere = {i: b.orientation for i, b in enumerate(mesh.bones)}
             for frame in range(sequence.frames):
                 for number in range(len(mesh.bones)):
                     track = track_of_bone.get(number)
@@ -210,6 +221,13 @@ def _build_sequences(pkg, anim_sets, mesh, stats):
                         position = rest[number][0]
                     if rotation is None:
                         rotation = rest[number][1]
+                    # Carried forward per bone, so a track stays continuous
+                    # with itself as well as agreeing with the bind pose.
+                    previous = hemisphere.get(number)
+                    if previous is not None and \
+                            sum(a * b for a, b in zip(rotation, previous)) < 0.0:
+                        rotation = tuple(-c for c in rotation)
+                    hemisphere[number] = rotation
                     keys.append((position, rotation))
             out.append((sequence.name, set_name, sequence.frames,
                         sequence.rate, keys))
