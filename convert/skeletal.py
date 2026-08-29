@@ -20,7 +20,8 @@ number is mapped through it on the way out.
 
 import os
 
-from ut2.psk import write_psk
+from ut2.psk import write_psa, write_psk
+from ut3.objects.anim import AnimError, read_anim_sequence, read_anim_set
 from ut3.objects.skeletalmesh import SkeletalError, read_skeletal_mesh
 from .meshes import sanitize
 
@@ -34,10 +35,15 @@ class SkeletalStats:
         self.failed = []
         self.merged = 0
         self.skinned = 0
+        self.sequences = 0
+        self.keys = 0
 
     def summary(self):
-        return ("%d skeletal mesh(es), %d bone(s), %d point(s), %d face(s)"
+        text = ("%d skeletal mesh(es), %d bone(s), %d point(s), %d face(s)"
                 % (self.meshes, self.bones, self.points, self.faces))
+        if self.sequences:
+            text += ", %d animation(s), %d key(s)" % (self.sequences, self.keys)
+        return text
 
 
 def _material_names(pkg, mesh, index=None):
@@ -131,8 +137,79 @@ def build_psk(pkg, mesh, stats=None):
     return points, wedges, faces, bones, influences
 
 
+def _anim_sets(pkg):
+    """Every AnimSet in the package, keyed by the mesh name it previews.
+
+    An AnimSet names its mesh through PreviewSkelMeshName -- a full path like
+    `VH_DarkWalker.Mesh.SK_VH_DarkWalker_Torso` -- which is the only link in
+    the data between a skeleton and the animations meant for it.
+    """
+    found = {}
+    for export in pkg.exports:
+        if pkg.class_name_of(export) != "AnimSet":
+            continue
+        try:
+            bones, sequences, mesh_name = read_anim_set(pkg, export)
+        except AnimError:
+            continue
+        if not mesh_name:
+            continue
+        found.setdefault(str(mesh_name).rsplit(".", 1)[-1], []).append(
+            (export.name, bones, sequences))
+    return found
+
+
+def _build_sequences(pkg, anim_sets, mesh, stats):
+    """Turn the AnimSets that target `mesh` into PSA sequences.
+
+    A track list is not the skeleton: the DarkWalker's torso animates 23 of its
+    34 bones. The other eleven still need a key every frame or the arrays stop
+    lining up with UnMeshEd's `frame * NumBones + bone`, so a bone with no
+    track holds its reference pose.
+    """
+    bone_number = {}
+    for i, bone in enumerate(mesh.bones):
+        bone_number.setdefault(bone.name.lower(), i)
+    rest = [(b.position, b.orientation) for b in mesh.bones]
+
+    out = []
+    for set_name, track_bones, refs in anim_sets:
+        # Track index -> bone number in the mesh's own skeleton.
+        track_of_bone = {}
+        for track, bone in enumerate(track_bones):
+            number = bone_number.get(str(bone).lower())
+            if number is not None:
+                track_of_bone[number] = track
+        for ref in refs:
+            if not 0 < ref <= len(pkg.exports):
+                continue
+            export = pkg.exports[ref - 1]
+            try:
+                sequence = read_anim_sequence(pkg, export)
+            except AnimError as exc:
+                stats.failed.append((export.name, str(exc)))
+                continue
+            keys = []
+            for frame in range(sequence.frames):
+                for number in range(len(mesh.bones)):
+                    track = track_of_bone.get(number)
+                    position, rotation = (None, None)
+                    if track is not None:
+                        position, rotation = sequence.sample(track, frame)
+                    if position is None:
+                        position = rest[number][0]
+                    if rotation is None:
+                        rotation = rest[number][1]
+                    keys.append((position, rotation))
+            out.append((sequence.name, set_name, sequence.frames,
+                        sequence.rate, keys))
+            stats.sequences += 1
+            stats.keys += len(keys)
+    return out
+
+
 def export_skeletal_meshes(pkg, exports, out_dir, package_name, index=None,
-                           texture_set=None, stats=None):
+                           texture_set=None, stats=None, with_anims=True):
     """Write a .psk per skeletal mesh; returns the #exec lines and the stats."""
     stats = stats or SkeletalStats()
     meshes_dir = os.path.join(out_dir, package_name, "Meshes")
@@ -140,6 +217,7 @@ def export_skeletal_meshes(pkg, exports, out_dir, package_name, index=None,
     if not exports:
         return lines, stats
     os.makedirs(meshes_dir, exist_ok=True)
+    anim_sets = _anim_sets(pkg) if with_anims else {}
 
     for export in exports:
         try:
@@ -175,6 +253,23 @@ def export_skeletal_meshes(pkg, exports, out_dir, package_name, index=None,
         lines.append("#exec MESH ORIGIN MESH=%s X=0 Y=0 Z=0" % name)
         lines.append("#exec MESHMAP NEW MESHMAP=%s MESH=%s" % (name, name))
         lines.append("#exec MESHMAP SCALE MESHMAP=%s X=1 Y=1 Z=1" % name)
+        sequences = _build_sequences(pkg, anim_sets.get(export.name, []),
+                                     mesh, stats)
+        if sequences:
+            write_psa(os.path.join(meshes_dir, name + ".psa"),
+                      bones, sequences)
+            lines.append("#exec ANIM IMPORT ANIM=%s_Anim ANIMFILE=Meshes\\%s.psa "
+                         "COMPRESS=1" % (name, name))
+            # USERAWINFO is not optional. Without it, DIGEST calls
+            # RawAnimSeqInfo.Empty() (UnEdSrv.cpp:1038) and throws away the
+            # ANIMINFO chunk naming the sequences -- the animation object is
+            # still created and the build still reports success, but it holds
+            # nothing. The alternative is an `#exec ANIM SEQUENCE` line per
+            # sequence restating what the PSA already says.
+            lines.append("#exec ANIM DIGEST ANIM=%s_Anim VERBOSE USERAWINFO"
+                         % name)
+            lines.append("#exec MESH DEFAULTANIM MESH=%s ANIM=%s_Anim"
+                         % (name, name))
         for slot, texture in enumerate(skins):
             if not texture:
                 continue

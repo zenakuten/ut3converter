@@ -92,3 +92,70 @@ def write_psk(path, points, wedges, faces, materials, bones, influences):
             payload += struct.pack("<fii", weight, point, bone)
         _chunk(handle, "RAWWEIGHTS", 12, len(influences), bytes(payload))
     return path
+
+
+def write_psa(path, bones, sequences):
+    """Write the animation companion to a .psk, read by `#exec ANIM IMPORT`.
+
+    `bones` is the same list write_psk was given -- the animation binds to the
+    mesh by bone list, so it has to be the mesh's whole skeleton and in the
+    same order, not just the tracks that happen to move.
+
+    `sequences` is [(name, group, frames, rate, keys)] where `keys` is
+    frame-major: frame 0's key for every bone, then frame 1's, matching
+    UnMeshEd.cpp:724 --
+
+        KeyIdx = (FirstRawFrame + f) * RefBones.Num() + b
+
+    All sequences share one key array and each names its slice through
+    FirstRawFrame, which is what that expression is reading.
+
+    Keys are Y-flipped exactly as the skin is, and for the same reason:
+    UnMeshEd.cpp:592-603 flips every key it reads, so writing UE3 data
+    unflipped animates mirrored.
+    """
+    with open(path, "wb") as handle:
+        _chunk(handle, "ANIMHEAD", 0, 0, b"")
+
+        payload = bytearray()
+        for name, flags, parent, quat, pos in bones:
+            qx, qy, qz, qw = quat
+            payload += _name(name)
+            payload += struct.pack("<Iii", flags, 0, parent)
+            payload += struct.pack("<4f", qx, -qy, qz, -qw)
+            payload += struct.pack("<3f", pos[0], -pos[1], pos[2])
+            payload += struct.pack("<4f", 0.0, 0.0, 0.0, 0.0)
+        _chunk(handle, "BONENAMES", 120, len(bones), bytes(payload))
+
+        payload = bytearray()
+        first_frame = 0
+        for seq_name, group, frames, rate, _seq_keys in sequences:
+            payload += _name(seq_name) + _name(group)
+            payload += struct.pack(
+                "<iiiifffiii",
+                len(bones),      # TotalBones
+                1,               # RootInclude
+                0,               # KeyCompressionStyle
+                len(bones) * frames,   # KeyQuotum
+                0.0,             # KeyReduction
+                frames / rate if rate else 0.0,   # TrackTime
+                rate,            # AnimRate
+                0,               # StartBone
+                first_frame,     # FirstRawFrame
+                frames,          # NumRawFrames
+            )
+            first_frame += frames
+        _chunk(handle, "ANIMINFO", 168, len(sequences), bytes(payload))
+
+        payload = bytearray()
+        count = 0
+        for _seq_name, _group, _frames, rate, keys in sequences:
+            step = 1.0 / rate if rate else 0.0
+            for position, quat in keys:
+                qx, qy, qz, qw = quat
+                payload += struct.pack("<3f", position[0], -position[1], position[2])
+                payload += struct.pack("<4f", qx, -qy, qz, -qw)
+                payload += struct.pack("<f", step)
+                count += 1
+        _chunk(handle, "ANIMKEYS", 32, count, bytes(payload))
+    return path
