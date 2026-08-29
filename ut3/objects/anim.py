@@ -48,9 +48,20 @@ class AnimError(Exception):
 
 
 def _quat_from_xyz(x, y, z):
-    """Restore W, which every NoW format drops -- the quaternion is unit."""
+    """Restore W, which every NoW format drops -- the quaternion is unit.
+
+    **The negative root.** UE3 stores X, Y and Z untouched and expects W back
+    as -sqrt(1 - x^2 - y^2 - z^2); taking the positive root yields (x, y, z, -w),
+    which is the *conjugate* -- the inverse rotation, not an equivalent one.
+    UT3's own data shows it plainly: ActiveStill is an idle pose, so its keys
+    should sit on the bind pose, and Leg2_Shoulder is bind (-.238,-.412,.440,
+    -.761) against a decoded (-.239,-.414,.439,+.761) -- three components
+    matching and W inverted. With the sign corrected the whole sequence lands
+    within 0.081 of bind, and the leg chain hangs from the root at z=582 down
+    to z=19 instead of rising above it to z=891.
+    """
     square = 1.0 - (x * x + y * y + z * z)
-    return (x, y, z, math.sqrt(square) if square > 0.0 else 0.0)
+    return (x, y, z, -math.sqrt(square) if square > 0.0 else 0.0)
 
 
 def _float96(data, at):
@@ -169,11 +180,14 @@ class AnimSet:
         self.bones = bones
         self.sequences = sequences
         self.mesh_name = mesh_name
-        # UAnimSet.bAnimRotationOnly defaults to TRUE, and a UT3 package only
-        # writes the property when it is FALSE -- so an absent property means
-        # rotation-only, not the other way round. The DarkWalker has one of
-        # each: the torso sets it False and animates its turret's translation,
-        # the legs leave it out and must take translation from the bind pose.
+        # Absent means the animation's own translations are used. This was
+        # briefly read the other way round, to explain legs that ballooned off
+        # their bind position -- but that turned out to be the W-sign bug in
+        # _quat_from_xyz above, and holding the bones at bind translation only
+        # masked it. With W right, the translations are plainly wanted: they
+        # are what lowers the walker's root from 582 to 210 through GetIn and
+        # puts its feet on the ground at z=0, where bind translations leave it
+        # floating between 371 and 665.
         self.rotation_only = rotation_only
         # The exceptions bAnimRotationOnly allows: these bones keep the
         # animation's own translation.
@@ -194,7 +208,7 @@ def read_anim_set(pkg, export):
         raise AnimError("AnimSet has no tracks or no sequences")
     rotation_only = props.get("bAnimRotationOnly")
     if rotation_only is None:
-        rotation_only = True
+        rotation_only = False
     return AnimSet(_fname_list(pkg, names), sequences.as_ints(),
                    props.get("PreviewSkelMeshName"), bool(rotation_only),
                    _fname_list(pkg, props.get("UseTranslationBoneNames")))
