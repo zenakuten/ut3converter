@@ -979,18 +979,18 @@ def cmd_t3d(args):
 # Everything else in a .upk -- SkeletalMesh, AnimSet, ParticleSystem,
 # PhysicsAsset, AnimTree -- has no UE2 equivalent this converter can write, so
 # it is counted and reported rather than silently ignored.
-ASSET_CLASSES = ("Texture2D", "StaticMesh", "SoundNodeWave")
+ASSET_CLASSES = ("Texture2D", "StaticMesh", "SoundNodeWave", "SkeletalMesh")
 
 # Named so the summary can say what it is leaving behind rather than just how
 # many exports it skipped. The count is what matters: a .upk whose content is
 # mostly skeletal is not worth extracting.
-UNCONVERTIBLE = ("SkeletalMesh", "AnimSet", "AnimSequence", "ParticleSystem",
+UNCONVERTIBLE = ("AnimSet", "AnimSequence", "ParticleSystem",
                  "PhysicsAsset", "AnimTree")
 
 
 def _build_package_assets(p, package_path, package_name, out_dir, max_size,
                           match=None, with_textures=True, with_meshes=True,
-                          with_sounds=True, scale=1.0):
+                          with_sounds=True, with_skeletal=True, scale=1.0):
     """Extract a content package's assets, with no level to walk.
 
     `_build_assets` above starts from a level and follows its actors, which is
@@ -1014,6 +1014,7 @@ def _build_package_assets(p, package_path, package_name, out_dir, max_size,
 
     mesh_set = MeshSet(package_name)
     sound_set = SoundSet(package_name)
+    skeletal = []
     for e in p.exports:
         cls = p.class_name_of(e)
         if cls in UNCONVERTIBLE:
@@ -1029,6 +1030,8 @@ def _build_package_assets(p, package_path, package_name, out_dir, max_size,
             mesh_set.meshes[mesh_set._unique(e.name)] = (p, e, (), None)
         elif cls == "SoundNodeWave" and with_sounds:
             sound_set.waves[sound_set._unique(e.name)] = (p, e)
+        elif cls == "SkeletalMesh" and with_skeletal:
+            skeletal.append(e)
         else:
             continue
         counts[cls] += 1
@@ -1041,6 +1044,14 @@ def _build_package_assets(p, package_path, package_name, out_dir, max_size,
             mesh_set, out_dir, index, texture_set, scale=scale
         )
         extra_exec = list(extra_exec)
+    skeletal_stats = None
+    if skeletal:
+        from convert.skeletal import export_skeletal_meshes
+
+        skel_exec, skeletal_stats = export_skeletal_meshes(
+            p, skeletal, out_dir, package_name, index, texture_set
+        )
+        extra_exec += list(skel_exec)
     sound_stats = None
     if with_sounds and sound_set.waves:
         sound_exec, sound_stats = export_sounds(sound_set, out_dir, index)
@@ -1056,23 +1067,30 @@ def _build_package_assets(p, package_path, package_name, out_dir, max_size,
         # the summary can say how many elements found a material.
         apply_skins([], mesh_set, texture_set, mesh_stats)
     return (texture_set, written, uc_path, counts, left, mesh_set, sound_set,
-            mesh_stats, sound_stats)
+            mesh_stats, sound_stats, skeletal_stats)
 
 
 def cmd_assets(args):
     p = Package(args.package)
     package_name = _texture_package_name(args.package, args.texture_package)
     (texture_set, written, uc_path, counts, left, mesh_set, sound_set,
-     mesh_stats, sound_stats) = _build_package_assets(
+     mesh_stats, sound_stats, skeletal_stats) = _build_package_assets(
         p, args.package, package_name, args.output, args.max_texture_size,
         match=args.match, with_textures=not args.no_textures,
         with_meshes=not args.no_meshes, with_sounds=not args.no_sounds,
-        scale=args.scale,
+        with_skeletal=not args.no_skeletal, scale=args.scale,
     )
     print("%s -> %s" % (os.path.basename(args.package), args.output))
     print("  package: %s" % os.path.join(args.output, package_name))
-    print("  %d texture(s), %d static mesh(es), %d sound(s)"
-          % (counts["Texture2D"], counts["StaticMesh"], counts["SoundNodeWave"]))
+    print("  %d texture(s), %d static mesh(es), %d sound(s), %d skeletal mesh(es)"
+          % (counts["Texture2D"], counts["StaticMesh"], counts["SoundNodeWave"],
+             counts["SkeletalMesh"]))
+    if skeletal_stats is not None and skeletal_stats.meshes:
+        print("      %s" % skeletal_stats.summary())
+    if skeletal_stats is not None and skeletal_stats.failed:
+        print("      %d skeletal mesh(es) did not parse: %s"
+              % (len(skeletal_stats.failed),
+                 ", ".join("%s (%s)" % pair for pair in skeletal_stats.failed[:3])))
     print("  %d texture file(s) written -> %s"
           % (written, os.path.basename(uc_path)))
     if sound_stats is not None and getattr(sound_stats, "failed", None):
@@ -1091,6 +1109,7 @@ def cmd_textures(args):
     """Textures only -- `assets` with the other two sweeps off."""
     args.no_meshes = True
     args.no_sounds = True
+    args.no_skeletal = True
     args.no_textures = False
     args.match = None
     args.scale = 1.0
@@ -1309,6 +1328,8 @@ def build_parser():
     sp.add_argument("--no-textures", action="store_true", help="skip Texture2D")
     sp.add_argument("--no-meshes", action="store_true", help="skip StaticMesh")
     sp.add_argument("--no-sounds", action="store_true", help="skip SoundNodeWave")
+    sp.add_argument("--no-skeletal", action="store_true",
+                    help="skip SkeletalMesh")
     sp.set_defaults(func=cmd_assets)
 
     sp = sub.add_parser("imports", help="list imports")
