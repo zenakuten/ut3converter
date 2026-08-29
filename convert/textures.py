@@ -1117,6 +1117,13 @@ def export_textures(texture_set, out_dir, index, max_size=DEFAULT_MAX_SIZE, grou
             os.path.join(textures_dir, name), mip.width, mip.height, fmt, data,
             mips=chain
         )
+        if path is None:
+            # to_bgra could not decode the format. Nothing a material draws
+            # reaches here, but --all-textures imports textures no material
+            # asked for, so the check has to come before anything touches
+            # `options` -- write_texture returns (None, None) on failure.
+            texture_set.drop(name, "unsupported format %s" % texture.format)
+            continue
         # Only the material can say what the alpha channel means: a hard cutout
         # (MASKED) or real blending (ALPHA). Cutouts win when both apply -- but
         # neither means anything without an alpha channel to test, and DXT1 has
@@ -1136,9 +1143,6 @@ def export_textures(texture_set, out_dir, index, max_size=DEFAULT_MAX_SIZE, grou
         # The size written, not the size UT3 declares: BSP surface UVs are
         # restated against it (see UE3_BSP_UV_SCALE).
         texture_set.exported_size[name] = (float(mip.width), float(mip.height))
-        if path is None:
-            texture_set.drop(name, "unsupported format %s" % texture.format)
-            continue
         opts = " ".join("%s=%s" % (k, v) for k, v in sorted(options.items()))
         exec_lines.append(
             "#exec TEXTURE IMPORT NAME=%s GROUP=%s FILE=Textures\\%s %s"

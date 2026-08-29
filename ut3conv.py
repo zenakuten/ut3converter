@@ -379,6 +379,13 @@ def cmd_t3d(args):
         if texture_set.extra:
             print("      %d imported only because --all-textures asked for them, "
                   "referenced by nothing" % len(texture_set.extra))
+        if texture_set.failed:
+            # Only --all-textures makes this ordinary: a texture no material
+            # draws can be in a format UE2 has no equivalent for, and dropping
+            # it silently would look like the flag had missed it.
+            print("      %d skipped, in a format UE2 cannot store: %s"
+                  % (len(texture_set.failed),
+                     ", ".join("%s (%s)" % pair for pair in texture_set.failed[:5])))
         if texture_set.composited:
             print("      %d had a separate UE3 opacity mask baked into their alpha"
                   % len(texture_set.composited))
